@@ -18,6 +18,7 @@ HandleUSBPcapControlIOCTL(PIRP pIrp, PIO_STACK_LOCATION pStack,
                           SIZE_T *outLength)
 {
     NTSTATUS ntStat = STATUS_SUCCESS;
+    KIRQL irql;
     if (pStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_USBPCAP_GET_HUB_SYMLINK)
     {
         PWSTR interfaces;
@@ -89,8 +90,10 @@ HandleUSBPcapControlIOCTL(PIRP pIrp, PIO_STACK_LOCATION pStack,
             }
 
             pAddressFilter = (PUSBPCAP_ADDRESS_FILTER)pIrp->AssociatedIrp.SystemBuffer;
+            KeAcquireSpinLock(&pRootData->bufferLock, &irql);
             memcpy(&pRootData->filter, pAddressFilter,
                    sizeof(USBPCAP_ADDRESS_FILTER));
+            KeReleaseSpinLock(&pRootData->bufferLock, irql);
 
             DkDbgStr("IOCTL_USBPCAP_START_FILTERING");
             DkDbgVal("", pAddressFilter->addresses[0]);
@@ -103,8 +106,10 @@ HandleUSBPcapControlIOCTL(PIRP pIrp, PIO_STACK_LOCATION pStack,
 
         case IOCTL_USBPCAP_STOP_FILTERING:
             DkDbgStr("IOCTL_USBPCAP_STOP_FILTERING");
+            KeAcquireSpinLock(&pRootData->bufferLock, &irql);
             memset(&pRootData->filter, 0,
                    sizeof(USBPCAP_ADDRESS_FILTER));
+            KeReleaseSpinLock(&pRootData->bufferLock, irql);
             break;
 
         case IOCTL_USBPCAP_SET_SNAPLEN_SIZE:
@@ -129,6 +134,7 @@ HandleUSBPcapControlIOCTL(PIRP pIrp, PIO_STACK_LOCATION pStack,
         {
             ULONG ctlCode = IoGetFunctionCodeFromCtlCode(pStack->Parameters.DeviceIoControl.IoControlCode);
             DkDbgVal("This: IOCTL_XXXXX", ctlCode);
+            UNREFERENCED_PARAMETER(ctlCode);
             ntStat = STATUS_INVALID_DEVICE_REQUEST;
             break;
         }
@@ -144,7 +150,6 @@ NTSTATUS DkDevCtl(PDEVICE_OBJECT pDevObj, PIRP pIrp)
     NTSTATUS            ntStat = STATUS_SUCCESS;
     PDEVICE_EXTENSION   pDevExt = NULL;
     PIO_STACK_LOCATION  pStack = NULL;
-    ULONG               ulRes = 0;
 
     pDevExt = (PDEVICE_EXTENSION) pDevObj->DeviceExtension;
 
@@ -179,7 +184,18 @@ NTSTATUS DkDevCtl(PDEVICE_OBJECT pDevObj, PIRP pIrp)
             allowCapture = TRUE;
         }
 
-        ntStat = HandleUSBPcapControlIOCTL(pIrp, pStack, rootExt, pRootData, allowCapture, &length);
+        KeWaitForSingleObject(&pDevExt->context.control.captureMutex,
+                              Executive, KernelMode, FALSE, NULL);
+        if (pDevExt->context.control.removing ||
+            (allowCapture && pDevExt->context.control.captureClosing))
+        {
+            ntStat = STATUS_DELETE_PENDING;
+        }
+        else
+        {
+            ntStat = HandleUSBPcapControlIOCTL(pIrp, pStack, rootExt, pRootData, allowCapture, &length);
+        }
+        KeReleaseMutex(&pDevExt->context.control.captureMutex, FALSE);
 
         info = (UINT_PTR)length;
 
@@ -326,11 +342,10 @@ NTSTATUS DkTgtInDevCtlCompletion(PDEVICE_OBJECT pDevObj, PIRP pIrp, PVOID pCtx)
     // URB is collected AFTER forward to bus driver or next lower object
     pStack = IoGetCurrentIrpStackLocation(pIrp);
     pUrb = (PURB) pStack->Parameters.Others.Argument1;
-    if (pUrb != NULL)
-    {
-        USBPcapAnalyzeURB(pIrp, pUrb, TRUE,
-                          pDevExt->context.usb.pDeviceData);
-    }
+    /* Completion tracking must retire even if the lower stack returns no URB.
+     * The analyzer validates context and retires metadata before parsing. */
+    USBPcapAnalyzeURB(pIrp, pUrb, TRUE,
+                      pDevExt->context.usb.pDeviceData);
 
     IoReleaseRemoveLock(&pDevExt->removeLock, (PVOID) pIrp);
 

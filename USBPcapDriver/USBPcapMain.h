@@ -47,13 +47,15 @@ typedef struct _USBPCAP_ROOTHUB_DATA
     /* Snapshot length */
     UINT32                 snaplen;
 
-    /* Address filter. See include\USBPcap.h for more information. */
+    /* Coherent filter state protected by bufferLock. */
     USBPCAP_ADDRESS_FILTER filter;
 
     /* Reference count. To be used only with InterlockedXXX calls. */
     volatile LONG          refCount;
 
     USHORT                 busId; /* bus number */
+    /* Publication protected by bufferLock. A producer acquires the control
+     * remove lock under that lock before using the pointer outside it. */
     PDEVICE_OBJECT         controlDevice;
 } USBPCAP_ROOTHUB_DATA, *PUSBPCAP_ROOTHUB_DATA;
 
@@ -121,7 +123,14 @@ typedef struct DEVICE_EXTENSION_Tag {
 
             LIST_ENTRY      lePendIrp;       // Used by I/O Cancel-Safe
             IO_CSQ          ioCsq;           // I/O Cancel-Safe object
-            KSPIN_LOCK      csqSpinLock;     // Spin lock object for I/O Cancel-Safe
+            /* Only nesting order: csqSpinLock -> root bufferLock. Never call
+             * IoCsqXxx or complete an IRP while holding root bufferLock. */
+            KSPIN_LOCK      csqSpinLock;
+            /* Admission flags protected by csqSpinLock. */
+            BOOLEAN         removing;
+            BOOLEAN         captureClosing;
+            /* Serializes passive create/cleanup/control IOCTL state changes. */
+            KMUTEX          captureMutex;
         } control;
 
         /* For USBPCAP_MAGIC_ROOTHUB or USBPCAP_MAGIC_DEVICE */
@@ -178,7 +187,7 @@ VOID DkCompleteRequest(PIRP pIrp, NTSTATUS resStat, UINT_PTR uiInfo);
 // Macro to show some "debugging messages" to a debugging tool
 //
 #define DkDbgStr(a)    KdPrint(("USBPcap, %s(): %s\n", __FUNCTION__, a))
-#define DkDbgVal(a, b) KdPrint(("USBPcap, %s(): %s ("#b" = 0x%X)\n", __FUNCTION__, a, b))
+#define DkDbgVal(a, b) KdPrint(("USBPcap, %s(): %s ("#b" = 0x%I64X)\n", __FUNCTION__, a, (ULONGLONG)(ULONG_PTR)(b)))
 
 
 ///////////////////////////////////////////////////////////////////////////

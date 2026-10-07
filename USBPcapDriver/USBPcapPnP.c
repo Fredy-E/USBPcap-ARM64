@@ -79,6 +79,16 @@ NTSTATUS DkHubFltPnP(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATION pStack, PIRP 
 
             return ntStat;
 
+        case IRP_MN_SURPRISE_REMOVAL:
+        {
+            PUSBPCAP_ROOTHUB_DATA rootData = pDevExt->context.usb.pDeviceData->pRootData;
+            if (rootData->controlDevice != NULL)
+            {
+                USBPcapDeleteRootHubControlDevice(rootData->controlDevice);
+            }
+            break; /* Preserve ordinary lower-stack PnP forwarding. */
+        }
+
         case IRP_MN_REMOVE_DEVICE:
         {
             PUSBPCAP_DEVICE_DATA pDeviceData = pDevExt->context.usb.pDeviceData;
@@ -146,28 +156,71 @@ NTSTATUS DkTgtPnP(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATION pStack, PIRP pIr
     switch (pStack->MinorFunction)
     {
         case IRP_MN_START_DEVICE:
-            /* IRP_MN_START_DEVICE is sent at PASSIVE_LEVEL */
-            DkDbgStr("IRP_MN_START_DEVICE");
+        {
+            DEVICE_EXTENSION queryExtension = {0};
+            USBPCAP_DEVICE_DATA queryData = {0};
+            KIRQL metadataIrql;
+            PVOID endpoint;
 
+            /* START is a publication boundary, including on restart. Withdraw
+             * the previous address before any lower/query completion reentry.
+             * Unknown metadata must not be stored in the endpoint table. */
+            KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &metadataIrql);
+            pDeviceData->properData = FALSE;
+            pDeviceData->parentPort = 0;
+            pDeviceData->deviceAddress = 255; /* UNKNOWN / capture unavailable */
+            pDeviceData->isHub = FALSE;
+            if (pDeviceData->endpointTable != NULL)
+            {
+                while ((endpoint = RtlGetElementGenericTable(
+                            pDeviceData->endpointTable, 0)) != NULL)
+                {
+                    RtlDeleteElementGenericTable(pDeviceData->endpointTable,
+                                                  endpoint);
+                }
+            }
+            KeReleaseSpinLock(&pDeviceData->tablesSpinLock, metadataIrql);
+
+            /* Query pageable helpers only after successful lower START, and
+             * only into private staging data: the helper can fail after a
+             * partial port update. Its filter update uses root bufferLock. */
             ntStat = DkForwardAndWait(pDevExt->pNextDevObj, pIrp);
+            if (NT_SUCCESS(ntStat))
+            {
+                queryExtension.deviceMagic = pDevExt->deviceMagic;
+                queryExtension.pNextDevObj = pDevExt->pNextDevObj;
+                queryExtension.context.usb.pDeviceData = &queryData;
+                queryData.pNextParentFlt = pDeviceData->pNextParentFlt;
+                queryData.pRootData = pDeviceData->pRootData;
+                if (NT_SUCCESS(USBPcapGetDeviceUSBInfo(&queryExtension)))
+                {
+                    KeAcquireSpinLock(&pDeviceData->tablesSpinLock,
+                                      &metadataIrql);
+                    pDeviceData->parentPort = queryData.parentPort;
+                    pDeviceData->isHub = queryData.isHub;
+                    pDeviceData->deviceAddress = queryData.deviceAddress;
+                    pDeviceData->properData = TRUE;
+                    KeReleaseSpinLock(&pDeviceData->tablesSpinLock,
+                                      metadataIrql);
+                }
+                /* Information failure omits capture metadata, never changes
+                 * the successful lower START status or IRP information. */
+            }
             IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-
-            if (NT_SUCCESS(USBPcapGetDeviceUSBInfo(pDevExt)))
-            {
-                DkDbgVal("Started device", pDeviceData->deviceAddress);
-            }
-            else
-            {
-                DkDbgStr("Failed to get info of started device");
-            }
             IoReleaseRemoveLock(&pDevExt->removeLock, (PVOID) pIrp);
             return ntStat;
+        }
 
         case IRP_MN_QUERY_DEVICE_RELATIONS:
-            /* Keep track of, and create child devices only for hubs.
-             * Do not create child filters for composite devices.
-             */
-            if (pDeviceData->isHub == TRUE)
+        {
+            BOOLEAN isHub;
+            KIRQL metadataIrql;
+            /* Metadata publication and topology decisions share one lock. */
+            KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &metadataIrql);
+            isHub = pDeviceData->properData && pDeviceData->isHub;
+            KeReleaseSpinLock(&pDeviceData->tablesSpinLock, metadataIrql);
+            /* Do not create child filters for composite/unknown devices. */
+            if (isHub)
             {
                 DkDbgStr("IRP_MN_QUERY_DEVICE_RELATIONS");
                 ntStat = DkHubFltPnpHandleQryDevRels(pDevExt, pStack, pIrp);
@@ -179,6 +232,7 @@ NTSTATUS DkTgtPnP(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATION pStack, PIRP pIr
             {
                 break;
             }
+        }
 
         case IRP_MN_REMOVE_DEVICE:
             DkDbgStr("IRP_MN_REMOVE_DEVICE");
@@ -247,6 +301,23 @@ NTSTATUS DkHubFltPnpHandleQryDevRels(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATI
                 pDevRel = (PDEVICE_RELATIONS) pIrp->IoStatus.Information;
                 if (pDevRel)
                 {
+                    PDEVICE_OBJECT *children = NULL;
+                    ULONG tracked = 0;
+                    /* Allocate bookkeeping before attaching anything. On
+                     * failure retain the previous list: forgetting attached
+                     * children would stack duplicate filters next query. */
+                    if ((SIZE_T)pDevRel->Count <
+                        ((SIZE_T)-1) / sizeof(PDEVICE_OBJECT))
+                    {
+                        children = ExAllocatePoolWithTag(NonPagedPool,
+                            ((SIZE_T)pDevRel->Count + 1) * sizeof(PDEVICE_OBJECT),
+                            DKPORT_MTAG);
+                    }
+                    if (children == NULL)
+                    {
+                        DkDbgStr("Cannot track children; retaining existing filters");
+                        goto CompleteBusRelations;
+                    }
                     USBPcapPrintUSBPChildrenInformation(pDevExt->pNextDevObj);
 
                     DkDbgVal("Child(s) number", pDevRel->Count);
@@ -275,8 +346,12 @@ NTSTATUS DkHubFltPnpHandleQryDevRels(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATI
                         if (found == FALSE)
                         {
                             /* New device attached */
-                            DkCreateAndAttachTgt(pDevExt,
-                                                 pDevRel->Objects[i]);
+                            found = NT_SUCCESS(DkCreateAndAttachTgt(pDevExt,
+                                                 pDevRel->Objects[i]));
+                        }
+                        if (found)
+                        {
+                            children[tracked++] = pDevRel->Objects[i];
                         }
                     }
 
@@ -287,41 +362,12 @@ NTSTATUS DkHubFltPnpHandleQryDevRels(PDEVICE_EXTENSION pDevExt, PIO_STACK_LOCATI
                         pDeviceData->previousChildren = NULL;
                     }
 
-                    if (pDevRel->Count > 0)
-                    {
-                        PDEVICE_OBJECT *children;
-
-                        children =
-                            ExAllocatePoolWithTag(NonPagedPool,
-                                                  sizeof(PDEVICE_OBJECT) *
-                                                  (pDevRel->Count + 1),
-                                                  DKPORT_MTAG);
-
-                        if (children != NULL)
-                        {
-                            for (i = 0; i < pDevRel->Count; i++)
-                            {
-                                children[i] = pDevRel->Objects[i];
-                            }
-
-                            /* NULL-terminate the array */
-                            children[pDevRel->Count] = NULL;
-
-                            pDeviceData->previousChildren = children;
-                        }
-                        else
-                        {
-                            /* Failed to allocate memory. Just leave it
-                             * as it. In next pass we won't check for
-                             * new devices (probably will miss some).
-                             * But it's probably the best we can do.
-                             */
-                            DkDbgStr("Failed to allocate previousChildren");
-                        }
-                    }
+                    children[tracked] = NULL;
+                    pDeviceData->previousChildren = children;
                 }
             }
 
+CompleteBusRelations:
             IoCompleteRequest(pIrp, IO_NO_INCREMENT);
 
             IoReleaseRemoveLock(&pDevExt->removeLock, (PVOID) pIrp);

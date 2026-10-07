@@ -203,10 +203,12 @@ NTSTATUS USBPcapGetPDODriverKey(PDEVICE_OBJECT pdo_device,
 {
     NTSTATUS status;
     ULONG length;
-    ULONG idx;
 
     PAGED_CODE();
     ASSERT(KeGetCurrentIrql() <= PASSIVE_LEVEL);
+
+    /* Publish only an owned allocation; failures leave capture info absent. */
+    *plocation = NULL;
 
     /* Query driverKeyName length */
     status = IoGetDeviceProperty(pdo_device,
@@ -241,6 +243,10 @@ NTSTATUS USBPcapGetPDODriverKey(PDEVICE_OBJECT pdo_device,
     *plocation = (PWCHAR)ExAllocatePoolWithTag(NonPagedPool,
                                                length,
                                                ' YEK');
+    if (*plocation == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     status = IoGetDeviceProperty(pdo_device,
                                  DevicePropertyDriverKeyName,
@@ -435,7 +441,7 @@ NTSTATUS USBPcapGetTargetDevicePort(PDEVICE_OBJECT parent,
     }
 
     RtlInitUnicodeString(&pdo_str, pdo_driverkey);
-    KdPrint(("PDO Driver key: %wZ\n", pdo_str));
+    KdPrint(("PDO Driver key: %wZ\n", &pdo_str));
 
     found = FALSE;
 
@@ -449,7 +455,7 @@ NTSTATUS USBPcapGetTargetDevicePort(PDEVICE_OBJECT parent,
             BOOLEAN equal;
 
             RtlInitUnicodeString(&str, pname->DriverKeyName);
-            KdPrint(("Port %d driver key name %wZ\n", idx, str));
+            KdPrint(("Port %d driver key name %wZ\n", idx, &str));
 
             equal = RtlEqualUnicodeString(&pdo_str, &str, TRUE);
 
@@ -696,6 +702,7 @@ NTSTATUS USBPcapGetDeviceUSBInfo(PDEVICE_EXTENSION pDevExt)
     if (NT_SUCCESS(status))
     {
         PUSBPCAP_ROOTHUB_DATA pRootData;
+        KIRQL filterIrql;
 
         DkDbgVal("", info.DeviceAddress);
 
@@ -705,10 +712,12 @@ NTSTATUS USBPcapGetDeviceUSBInfo(PDEVICE_EXTENSION pDevExt)
 
         /* Set device filtered if capture from new devices is enabled. */
         pRootData = pDevExt->context.usb.pDeviceData->pRootData;
+        KeAcquireSpinLock(&pRootData->bufferLock, &filterIrql);
         if (USBPcapIsDeviceFiltered(&pRootData->filter, 0))
         {
             USBPcapSetDeviceFiltered(&pRootData->filter, info.DeviceAddress);
         }
+        KeReleaseSpinLock(&pRootData->bufferLock, filterIrql);
     }
     else
     {
@@ -816,10 +825,12 @@ BOOLEAN USBPcapIsDeviceRootHub(PDEVICE_OBJECT device)
     PDEVICE_OBJECT  pdo;
     WCHAR           *hwid;
     WCHAR           *hardwareIds[MAX_HARDWARE_IDS] = {NULL};
-    ULONG           length;
+    ULONG           length = 0;
+    ULONG           characters;
     ULONG           i;
     ULONG           id;
     ULONG           start;
+    BOOLEAN         terminated = FALSE;
     BOOLEAN         found = FALSE;
 
     PAGED_CODE();
@@ -860,24 +871,56 @@ BOOLEAN USBPcapIsDeviceRootHub(PDEVICE_OBJECT device)
         return FALSE;
     }
 
+    /* Fail closed on malformed or over-capacity MULTI_SZ data. Do not use
+     * zero-filled allocation slack as a substitute for returned termination. */
+    if ((length < 2 * sizeof(WCHAR)) ||
+        (length > REGSTR_VAL_MAX_HCID_LEN) ||
+        ((length % sizeof(WCHAR)) != 0))
+    {
+        goto RootHubDone;
+    }
+    characters = length / sizeof(WCHAR);
     id = 0;
     start = 0;
-    for (i = 0; i < (length/sizeof(WCHAR)); i++)
+    for (i = 0; i < characters; i++)
     {
         if (hwid[i] == L'\0')
         {
             if (start == i)
             {
-                /* This is the end of hardware IDs */
+                /* Empty list requires two NULs as well. Allow only NUL
+                 * padding after the list; never accept hidden trailing IDs. */
+                if ((i == 0) && (hwid[1] != L'\0'))
+                {
+                    goto RootHubDone;
+                }
+                for (; i < characters; i++)
+                {
+                    if (hwid[i] != L'\0')
+                    {
+                        goto RootHubDone;
+                    }
+                }
+                terminated = TRUE;
                 break;
             }
             else
             {
+                /* Check BEFORE writing the fixed-size pointer array. Reject
+                 * the entire list on excess IDs, even if an earlier ID matches. */
+                if (id >= MAX_HARDWARE_IDS)
+                {
+                    goto RootHubDone;
+                }
                 hardwareIds[id] = &hwid[start];
                 id++;
                 start = i+1;
             }
         }
+    }
+    if (terminated == FALSE)
+    {
+        goto RootHubDone;
     }
 
     while (id > 0)
@@ -918,6 +961,7 @@ BOOLEAN USBPcapIsDeviceRootHub(PDEVICE_OBJECT device)
         }
     }
 
+RootHubDone:
     ExFreePool((PVOID)hwid);
 
     return found;
@@ -976,8 +1020,8 @@ static BOOLEAN USBPcapGetAddressRangeAndIndex(int address, UINT8 *range, UINT8 *
         return FALSE;
     }
 
-    *range = address / 32;
-    *index = address % 32;
+    *range = (UINT8)(address / 32);
+    *index = (UINT8)(address % 32);
     return TRUE;
 }
 
@@ -1001,7 +1045,7 @@ BOOLEAN USBPcapIsDeviceFiltered(PUSBPCAP_ADDRESS_FILTER filter, int address)
         return TRUE;
     }
 
-    if (filter->addresses[range] & (1 << index))
+    if (filter->addresses[range] & (1UL << index))
     {
         filtered = TRUE;
     }
@@ -1021,7 +1065,7 @@ BOOLEAN USBPcapSetDeviceFiltered(PUSBPCAP_ADDRESS_FILTER filter, int address)
         return FALSE;
     }
 
-    filter->addresses[range] |= (1 << index);
+    filter->addresses[range] |= (1UL << index);
     return TRUE;
 }
 

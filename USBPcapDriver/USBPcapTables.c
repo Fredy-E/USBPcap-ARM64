@@ -54,7 +54,12 @@ VOID USBPcapAddEndpointInfo(IN PRTL_GENERIC_TABLE table,
                                  sizeof(USBPCAP_INTERNAL_ENDPOINT_INFO),
                                  &new);
 
-    if ((new == FALSE) && (pInfo != NULL))
+    if (pInfo == NULL)
+    {
+        DkDbgStr("Unable to allocate endpoint entry; capture metadata omitted");
+        return;
+    }
+    if (new == FALSE)
     {
         DkDbgStr("Element already exists in table, updating entry");
         pInfo->info.type            = pipeInfo->PipeType;
@@ -236,16 +241,23 @@ VOID USBPcapAddURBIRPInfo(IN PRTL_GENERIC_TABLE table,
 {
     USBPCAP_INTERNAL_URB_IRP_INFO   info;
     BOOLEAN                         new;
+    PUSBPCAP_INTERNAL_URB_IRP_INFO entry;
 
     info.info = *irpinfo;
 
-    RtlInsertElementGenericTable(table,
+    entry = RtlInsertElementGenericTable(table,
                                  (PVOID)&info,
                                  sizeof(USBPCAP_INTERNAL_URB_IRP_INFO),
                                  &new);
 
+    if (entry == NULL)
+    {
+        DkDbgStr("Unable to allocate submission entry; capture metadata omitted");
+        return;
+    }
     if (new == FALSE)
     {
+        entry->info = *irpinfo;
         DkDbgVal("Element already exists in table", irpinfo->irp);
     }
 }

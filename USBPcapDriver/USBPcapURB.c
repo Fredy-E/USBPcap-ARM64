@@ -63,8 +63,13 @@ static PVOID USBPcapURBGetBufferPointer(ULONG length,
     }
     else if (bufferMDL != NULL)
     {
-        PVOID address = MmGetSystemAddressForMdlSafe(bufferMDL,
-                                                     NormalPagePriority);
+        PVOID address;
+        if (length > MmGetMdlByteCount(bufferMDL))
+        {
+            return NULL;
+        }
+        address = MmGetSystemAddressForMdlSafe(bufferMDL,
+                                              NormalPagePriority | MdlMappingNoExecute);
         return address;
     }
     else
@@ -87,11 +92,11 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
      * Add endpoint information to endpoint table
      */
     i = 0;
-    while (interfaces_len != 0 && pInterface->Length != 0)
+    while (interfaces_len != 0)
     {
-        PUSBD_PIPE_INFORMATION Pipe = pInterface->Pipes;
+        PUSBD_PIPE_INFORMATION Pipe;
 
-        if (interfaces_len < sizeof(USBD_INTERFACE_INFORMATION))
+        if (interfaces_len < offsetof(USBD_INTERFACE_INFORMATION, Pipes))
         {
             /* There is no enough bytes to hold USBD_INTERFACE_INFORMATION.
              * Stop parsing.
@@ -101,7 +106,8 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
             break;
         }
 
-        if (pInterface->Length > interfaces_len)
+        if (pInterface->Length < offsetof(USBD_INTERFACE_INFORMATION, Pipes) ||
+            pInterface->Length > interfaces_len)
         {
             /* Interface expands beyond URB, don't try to parse it. */
             KdPrint(("Interface length: %d. Remaining bytes: %d. "
@@ -110,27 +116,15 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
             break;
         }
 
-        /* At this point if NumberOfPipes is either 0 or 1 we can proceed
-         * as sizeof(USBD_INTERFACE_INFORMATION) covers interface
-         * information together with one pipe information.
-         *
-         * Perform additional sanity check if there is more than one pipe in
-         * the interface.
-         */
-        if (pInterface->NumberOfPipes > 1)
+        /* Bound pipes by this interface, using division to avoid overflow. */
+        if (pInterface->NumberOfPipes >
+            (pInterface->Length - offsetof(USBD_INTERFACE_INFORMATION, Pipes)) /
+            sizeof(USBD_PIPE_INFORMATION))
         {
-            ULONG required_length;
-            required_length = sizeof(USBD_INTERFACE_INFORMATION) +
-                              ((pInterface->NumberOfPipes - 1) *
-                               sizeof(USBD_PIPE_INFORMATION));
-
-            if (interfaces_len < required_length)
-            {
-                KdPrint(("%d pipe information does not fit in %d bytes.",
-                         pInterface->NumberOfPipes, interfaces_len));
-                break;
-            }
+            DkDbgStr("Pipe information exceeds interface length");
+            break;
         }
+        Pipe = pInterface->Pipes;
 
         /* End of sanity checks, parse pipe information. */
         KdPrint(("Interface %d Len: %d Class: %02x Subclass: %02x"
@@ -143,7 +137,7 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
         {
             KdPrint(("Pipe %d MaxPacketSize: %d"
                     "EndpointAddress: %d PipeType: %d"
-                    "PipeHandle: %02x\n",
+                    "PipeHandle: %p\n",
                     j,
                     Pipe->MaximumPacketSize,
                     Pipe->EndpointAddress,
@@ -152,9 +146,14 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
 
             KeAcquireSpinLock(&pDeviceData->tablesSpinLock,
                               &irql);
-            USBPcapAddEndpointInfo(pDeviceData->endpointTable,
-                                   Pipe,
-                                   pDeviceData->deviceAddress);
+            /* START/query failure leaves capture metadata unavailable. Never
+             * persist UNKNOWN (255) or a previous start's address in pipes. */
+            if (pDeviceData->properData)
+            {
+                USBPcapAddEndpointInfo(pDeviceData->endpointTable,
+                                       Pipe,
+                                       pDeviceData->deviceAddress);
+            }
             KeReleaseSpinLock(&pDeviceData->tablesSpinLock,
                               irql);
         }
@@ -165,6 +164,18 @@ USBPcapParseInterfaceInformation(PUSBPCAP_DEVICE_DATA pDeviceData,
         pInterface = (PUSBD_INTERFACE_INFORMATION)
                          ((PUCHAR)pInterface + pInterface->Length);
     }
+}
+
+/* Metadata reads pair with START's coherent publication. 255 denotes capture
+ * information unavailable; it is never committed to endpoint storage. */
+static USHORT USBPcapDeviceAddress(PUSBPCAP_DEVICE_DATA pDeviceData)
+{
+    USHORT address;
+    KIRQL irql;
+    KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &irql);
+    address = pDeviceData->properData ? pDeviceData->deviceAddress : 255;
+    KeReleaseSpinLock(&pDeviceData->tablesSpinLock, irql);
+    return address;
 }
 
 __inline static VOID
@@ -201,7 +212,7 @@ USBPcapAnalyzeControlTransfer(struct _URB_CONTROL_TRANSFER* transfer,
     }
 
     packetHeader.header.bus      = pDeviceData->pRootData->busId;
-    packetHeader.header.device   = pDeviceData->deviceAddress;
+    packetHeader.header.device   = USBPcapDeviceAddress(pDeviceData);
 
     packetHeader.header.endpoint = 0;
     if ((transfer->TransferFlags & USBD_DEFAULT_PIPE_TRANSFER) ||
@@ -297,6 +308,45 @@ USBPcapAnalyzeControlTransfer(struct _URB_CONTROL_TRANSFER* transfer,
     }
 }
 
+/* The caller owns a complete descriptor as required by the select-configuration
+ * URB contract. Validate its internal chain before copying or parsing it. */
+static BOOLEAN USBPcapValidConfigurationDescriptor(PUSB_CONFIGURATION_DESCRIPTOR descriptor)
+{
+    ULONG offset = 0;
+    ULONG total;
+    PUCHAR bytes = (PUCHAR)descriptor;
+
+    if (descriptor == NULL)
+    {
+        return FALSE;
+    }
+    total = descriptor->wTotalLength;
+    if (total < sizeof(*descriptor) || descriptor->bLength < sizeof(*descriptor) ||
+        descriptor->bDescriptorType != USB_CONFIGURATION_DESCRIPTOR_TYPE)
+    {
+        return FALSE;
+    }
+    while (offset < total)
+    {
+        ULONG length;
+        if (total - offset < 2)
+        {
+            return FALSE;
+        }
+        length = bytes[offset];
+        if (length < 2 || length > total - offset ||
+            (bytes[offset + 1] == USB_INTERFACE_DESCRIPTOR_TYPE &&
+             length < sizeof(USB_INTERFACE_DESCRIPTOR)) ||
+            (bytes[offset + 1] == USB_ENDPOINT_DESCRIPTOR_TYPE &&
+             length < sizeof(USB_ENDPOINT_DESCRIPTOR)))
+        {
+            return FALSE;
+        }
+        offset += length;
+    }
+    return TRUE;
+}
+
 /*
  * Analyzes the URB
  *
@@ -307,24 +357,105 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
                        PUSBPCAP_DEVICE_DATA pDeviceData)
 {
     struct _URB_HEADER     *header;
-    USBPCAP_URB_IRP_INFO    unknownURBSubmitInfo;
+    USBPCAP_URB_IRP_INFO    unknownURBSubmitInfo = {0};
     BOOLEAN                 hasUnknownURBSubmitInfo;
+    SIZE_T                  requiredLength;
+    USHORT                  deviceAddress;
 
+    if (pDeviceData == NULL || pDeviceData->pRootData == NULL)
+    {
+        return;
+    }
+
+    deviceAddress = USBPcapDeviceAddress(pDeviceData);
+
+    /* Retire submission tracking on every completion with a valid context,
+     * even when the returned URB is unusable for capture. */
+    hasUnknownURBSubmitInfo = FALSE;
+    if (post)
+    {
+        hasUnknownURBSubmitInfo =
+            USBPcapObtainURBIRPInfo(pDeviceData, pIrp, &unknownURBSubmitInfo);
+    }
+    if (pUrb == NULL || pUrb->UrbHeader.Length < sizeof(struct _URB_HEADER))
+    {
+        return;
+    }
     ASSERT(pUrb != NULL);
     ASSERT(pDeviceData != NULL);
     ASSERT(pDeviceData->pRootData != NULL);
 
     header = (struct _URB_HEADER*)pUrb;
 
-    /* Check if the IRP on its way from FDO to PDO had unknown URB function */
-    if (post)
+    /* Reject truncated typed URBs before dereferencing them. Only capture is
+     * skipped; the original USB request continues unchanged. */
+    requiredLength = sizeof(struct _URB_HEADER);
+    switch (header->Function)
     {
-        hasUnknownURBSubmitInfo =
-            USBPcapObtainURBIRPInfo(pDeviceData, pIrp, &unknownURBSubmitInfo);
+        case URB_FUNCTION_SELECT_CONFIGURATION:
+            requiredLength = offsetof(struct _URB_SELECT_CONFIGURATION, Interface);
+            break;
+        case URB_FUNCTION_SELECT_INTERFACE:
+            requiredLength = offsetof(struct _URB_SELECT_INTERFACE, Interface) + offsetof(USBD_INTERFACE_INFORMATION, Pipes);
+            break;
+        case URB_FUNCTION_CONTROL_TRANSFER:
+            requiredLength = sizeof(struct _URB_CONTROL_TRANSFER);
+            break;
+        case URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE:
+        case URB_FUNCTION_GET_DESCRIPTOR_FROM_ENDPOINT:
+        case URB_FUNCTION_GET_DESCRIPTOR_FROM_INTERFACE:
+        case URB_FUNCTION_SET_DESCRIPTOR_TO_DEVICE:
+        case URB_FUNCTION_SET_DESCRIPTOR_TO_ENDPOINT:
+        case URB_FUNCTION_SET_DESCRIPTOR_TO_INTERFACE:
+            requiredLength = sizeof(struct _URB_CONTROL_DESCRIPTOR_REQUEST);
+            break;
+        case URB_FUNCTION_GET_STATUS_FROM_DEVICE:
+        case URB_FUNCTION_GET_STATUS_FROM_INTERFACE:
+        case URB_FUNCTION_GET_STATUS_FROM_ENDPOINT:
+        case URB_FUNCTION_GET_STATUS_FROM_OTHER:
+            requiredLength = sizeof(struct _URB_CONTROL_GET_STATUS_REQUEST);
+            break;
+        case URB_FUNCTION_VENDOR_DEVICE:
+        case URB_FUNCTION_VENDOR_INTERFACE:
+        case URB_FUNCTION_VENDOR_ENDPOINT:
+        case URB_FUNCTION_VENDOR_OTHER:
+        case URB_FUNCTION_CLASS_DEVICE:
+        case URB_FUNCTION_CLASS_INTERFACE:
+        case URB_FUNCTION_CLASS_ENDPOINT:
+        case URB_FUNCTION_CLASS_OTHER:
+            requiredLength = sizeof(struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST);
+            break;
+        case URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER:
+            requiredLength = sizeof(struct _URB_BULK_OR_INTERRUPT_TRANSFER);
+            break;
+        case URB_FUNCTION_ISOCH_TRANSFER:
+            requiredLength = offsetof(struct _URB_ISOCH_TRANSFER, IsoPacket);
+            break;
+        case URB_FUNCTION_SYNC_RESET_PIPE_AND_CLEAR_STALL:
+        case URB_FUNCTION_SYNC_RESET_PIPE:
+        case URB_FUNCTION_SYNC_CLEAR_STALL:
+        case URB_FUNCTION_ABORT_PIPE:
+            requiredLength = sizeof(struct _URB_PIPE_REQUEST);
+            break;
+        case URB_FUNCTION_GET_CURRENT_FRAME_NUMBER:
+            requiredLength = sizeof(struct _URB_GET_CURRENT_FRAME_NUMBER);
+            break;
+#if (_WIN32_WINNT >= 0x0600)
+        case URB_FUNCTION_CONTROL_TRANSFER_EX:
+            requiredLength = sizeof(struct _URB_CONTROL_TRANSFER_EX);
+            break;
+#endif
+#if (_WIN32_WINNT >= 0x0602)
+        case URB_FUNCTION_CLOSE_STATIC_STREAMS:
+            requiredLength = sizeof(struct _URB_PIPE_REQUEST);
+            break;
+#endif
+        default:
+            break;
     }
-    else
+    if (header->Length < requiredLength)
     {
-        hasUnknownURBSubmitInfo = FALSE;
+        return;
     }
 
     /* Following URBs are always analyzed */
@@ -334,20 +465,25 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
         {
             struct _URB_SELECT_CONFIGURATION *pSelectConfiguration;
             USHORT interfaces_len;
+            PUSB_CONFIGURATION_DESCRIPTOR newDescriptor = NULL;
+            PUSB_CONFIGURATION_DESCRIPTOR oldDescriptor;
+            KIRQL descriptorIrql;
 
-            if (post == FALSE)
+            if (post == FALSE || !NT_SUCCESS(pIrp->IoStatus.Status) ||
+                !USBD_SUCCESS(header->Status))
             {
-                /* Pass the request to host controller,
-                 * we are interested only in select configuration
-                 * after the fields are set by host controller driver */
+                /* Only successful completion publishes actual state. Keep
+                 * retirement above and failure-packet logging below this gate. */
                 break;
             }
 
             DkDbgStr("URB_FUNCTION_SELECT_CONFIGURATION");
             pSelectConfiguration = (struct _URB_SELECT_CONFIGURATION*)pUrb;
 
-            /* Check if there is interface information in the URB */
-            if (pUrb->UrbHeader.Length > offsetof(struct _URB_SELECT_CONFIGURATION, Interface))
+            /* A NULL descriptor successfully unconfigures the device; its
+             * input interface bytes are not returned active pipe information. */
+            if (pSelectConfiguration->ConfigurationDescriptor != NULL &&
+                pUrb->UrbHeader.Length > offsetof(struct _URB_SELECT_CONFIGURATION, Interface))
             {
                 /* Calculate interfaces length */
                 interfaces_len = pUrb->UrbHeader.Length;
@@ -362,27 +498,26 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             }
 
             /* Store the configuration information for later use */
-            if (pDeviceData->descriptor != NULL)
-            {
-                ExFreePool((PVOID)pDeviceData->descriptor);
-            }
-
-            if (pSelectConfiguration->ConfigurationDescriptor != NULL)
+            if (USBPcapValidConfigurationDescriptor(pSelectConfiguration->ConfigurationDescriptor))
             {
                 SIZE_T descSize = pSelectConfiguration->ConfigurationDescriptor->wTotalLength;
-
-                pDeviceData->descriptor =
-                    ExAllocatePoolWithTag(NonPagedPool,
-                                          descSize,
-                                          (ULONG)'CSED');
-
-                RtlCopyMemory(pDeviceData->descriptor,
-                              pSelectConfiguration->ConfigurationDescriptor,
-                              (SIZE_T)descSize);
+                newDescriptor = ExAllocatePoolWithTag(NonPagedPool,
+                                                      descSize, (ULONG)'CSED');
+                if (newDescriptor != NULL)
+                {
+                    RtlCopyMemory(newDescriptor,
+                                  pSelectConfiguration->ConfigurationDescriptor,
+                                  descSize);
+                }
             }
-            else
+            /* Clear stale data even if replacement allocation fails. */
+            KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &descriptorIrql);
+            oldDescriptor = pDeviceData->descriptor;
+            pDeviceData->descriptor = newDescriptor;
+            KeReleaseSpinLock(&pDeviceData->tablesSpinLock, descriptorIrql);
+            if (oldDescriptor != NULL)
             {
-                pDeviceData->descriptor = NULL;
+                ExFreePool(oldDescriptor);
             }
 
             break;
@@ -393,11 +528,11 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             struct _URB_SELECT_INTERFACE *pSelectInterface;
             USHORT interfaces_len;
 
-            if (post == FALSE)
+            if (post == FALSE || !NT_SUCCESS(pIrp->IoStatus.Status) ||
+                !USBD_SUCCESS(header->Status))
             {
-                /* Pass the request to host controller,
-                 * we are interested only in select interface
-                 * after the fields are set by host controller driver */
+                /* Failed requests do not publish attempted pipe information.
+                 * Logging/retirement remain independent of state commitment. */
                 break;
             }
 
@@ -425,11 +560,18 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             break;
     }
 
-    if (USBPcapIsDeviceFiltered(&pDeviceData->pRootData->filter,
-                                (int)pDeviceData->deviceAddress) == FALSE)
     {
-        /* Do not log URBs from devices which are not being filtered */
-        return;
+        BOOLEAN filtered;
+        KIRQL filterIrql;
+        KeAcquireSpinLock(&pDeviceData->pRootData->bufferLock, &filterIrql);
+        filtered = USBPcapIsDeviceFiltered(&pDeviceData->pRootData->filter,
+                                           (int)deviceAddress);
+        KeReleaseSpinLock(&pDeviceData->pRootData->bufferLock, filterIrql);
+        if (filtered == FALSE)
+        {
+            /* Do not log URBs from devices which are not being filtered. */
+            return;
+        }
     }
 
     if (hasUnknownURBSubmitInfo)
@@ -503,11 +645,16 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             struct _URB_CONTROL_TRANSFER wrapTransfer;
             PUSBD_INTERFACE_INFORMATION  intInfo;
             PUSB_INTERFACE_DESCRIPTOR    intDescriptor;
+            UCHAR                        alternateSetting;
+            UCHAR                        interfaceNumber;
+            KIRQL                        descriptorIrql;
 
             pSelectInterface = (struct _URB_SELECT_INTERFACE*)pUrb;
 
+            KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &descriptorIrql);
             if (pDeviceData->descriptor == NULL)
             {
+                KeReleaseSpinLock(&pDeviceData->tablesSpinLock, descriptorIrql);
                 /* Won't log this URB */
                 DkDbgStr("No configuration descriptor");
                 break;
@@ -527,6 +674,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
 
             if (intDescriptor == NULL)
             {
+                KeReleaseSpinLock(&pDeviceData->tablesSpinLock, descriptorIrql);
                 /* Interface descriptor not found */
                 DkDbgStr("Failed to get interface descriptor");
                 break;
@@ -540,9 +688,12 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             wrapTransfer.SetupPacket[0] = 0x00; /* Host to Device, Standard */
             wrapTransfer.SetupPacket[1] = 0x0B; /* SET_INTERFACE */
 
-            wrapTransfer.SetupPacket[2] = intDescriptor->bAlternateSetting;
+            alternateSetting = intDescriptor->bAlternateSetting;
+            interfaceNumber = intDescriptor->bInterfaceNumber;
+            KeReleaseSpinLock(&pDeviceData->tablesSpinLock, descriptorIrql);
+            wrapTransfer.SetupPacket[2] = alternateSetting;
             wrapTransfer.SetupPacket[3] = 0;
-            wrapTransfer.SetupPacket[4] = intDescriptor->bInterfaceNumber;
+            wrapTransfer.SetupPacket[4] = interfaceNumber;
             wrapTransfer.SetupPacket[5] = 0;
             wrapTransfer.SetupPacket[6] = 0;
             wrapTransfer.SetupPacket[7] = 0;
@@ -934,7 +1085,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             }
             else
             {
-                packetHeader.device = pDeviceData->deviceAddress;
+                packetHeader.device = deviceAddress;
                 packetHeader.endpoint = 0xFF;
                 packetHeader.transfer = USBPCAP_TRANSFER_BULK;
             }
@@ -984,6 +1135,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             PUSBPCAP_PAYLOAD_ENTRY        compactedPayloadEntries;
             PVOID                         captureBuffer;
             USHORT                        headerLen;
+            ULONG                         bufferCapacity;
             ULONG                         i;
 
             transfer = (struct _URB_ISOCH_TRANSFER*)pUrb;
@@ -994,10 +1146,39 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             DkDbgVal("", transfer->NumberOfPackets);
 
             /* Handle transfers up to maximum of 1024 packets */
-            if (transfer->NumberOfPackets > 1024)
+            if (transfer->NumberOfPackets == 0 || transfer->NumberOfPackets > 1024 ||
+                transfer->NumberOfPackets >
+                    (header->Length - offsetof(struct _URB_ISOCH_TRANSFER, IsoPacket)) /
+                    sizeof(USBD_ISO_PACKET_DESCRIPTOR))
             {
                 DkDbgVal("Too many packets for isochronous transfer",
                          transfer->NumberOfPackets);
+                break;
+            }
+
+            /* Completed IN byte counts do not bound sparse packet offsets.
+             * An MDL bounds the chosen buffer only when no direct pointer wins. */
+            bufferCapacity = transfer->TransferBufferLength;
+            if (post && (transfer->TransferFlags & USBD_TRANSFER_DIRECTION_IN) &&
+                transfer->TransferBuffer == NULL && transfer->TransferBufferMDL != NULL)
+            {
+                bufferCapacity = MmGetMdlByteCount(transfer->TransferBufferMDL);
+            }
+
+            /* Fail closed on sparse completed direct-buffer ISO layouts until
+             * submission-capacity tracking is implemented. This can omit capture
+             * data, but never changes the actual USB request or its completion. */
+            for (i = 0; i < transfer->NumberOfPackets; i++)
+            {
+                if (transfer->IsoPacket[i].Offset > bufferCapacity ||
+                    (post && transfer->IsoPacket[i].Length >
+                        bufferCapacity - transfer->IsoPacket[i].Offset))
+                {
+                    break;
+                }
+            }
+            if (i != transfer->NumberOfPackets)
+            {
                 break;
             }
 
@@ -1039,7 +1220,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             }
             else
             {
-                packetHeader->header.device = pDeviceData->deviceAddress;
+                packetHeader->header.device = deviceAddress;
                 packetHeader->header.endpoint = 0xFF;
             }
             packetHeader->header.transfer = USBPCAP_TRANSFER_ISOCHRONOUS;
@@ -1067,6 +1248,11 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
                         USBPcapURBGetBufferPointer(transfer->TransferBufferLength,
                                                    transfer->TransferBuffer,
                                                    transfer->TransferBufferMDL);
+                if (transferBuffer == NULL)
+                {
+                    ExFreePool((PVOID)packetHeader);
+                    break;
+                }
 
                 if (((transfer->TransferFlags & USBD_TRANSFER_DIRECTION_IN) == USBD_TRANSFER_DIRECTION_IN) && (post == TRUE))
                 {
@@ -1078,10 +1264,15 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
                     /* Compute the compacted transfer length by summing up the individual packet lengths */
                     for (i = 0; i < transfer->NumberOfPackets; i++)
                     {
+                        if (transfer->IsoPacket[i].Length >
+                            transfer->TransferBufferLength - compactedLength)
+                        {
+                            break;
+                        }
                         compactedLength += transfer->IsoPacket[i].Length;
                     }
 
-                    if (compactedLength > transfer->TransferBufferLength)
+                    if (i != transfer->NumberOfPackets)
                     {
                         /* This is a safety check -- the numbers don't add up (this should never happen) */
                         DkDbgStr("Sum of Isochronous transfer packet lengths exceeds transfer buffer length");
@@ -1194,7 +1385,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             }
             else
             {
-                packetHeader.device = pDeviceData->deviceAddress;
+                packetHeader.device = deviceAddress;
                 packetHeader.endpoint = 0xFF;
                 packetHeader.transfer = USBPCAP_TRANSFER_UNKNOWN;
             }
@@ -1220,7 +1411,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
             packetHeader.function   = header->Function;
             packetHeader.info       = 0;
             packetHeader.bus        = pDeviceData->pRootData->busId;
-            packetHeader.device     = pDeviceData->deviceAddress;
+            packetHeader.device     = deviceAddress;
             packetHeader.endpoint   = 0x80;
             packetHeader.transfer   = USBPCAP_TRANSFER_IRP_INFO;
             packetHeader.dataLength = 0;
@@ -1257,7 +1448,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
                 info.function = header->Function;
                 info.info = 0;
                 info.bus = pDeviceData->pRootData->busId;
-                info.device = pDeviceData->deviceAddress;
+                info.device = deviceAddress;
 
                 KeAcquireSpinLock(&pDeviceData->tablesSpinLock, &irql);
                 USBPcapAddURBIRPInfo(pDeviceData->URBIrpTable, &info);
@@ -1276,7 +1467,7 @@ VOID USBPcapAnalyzeURB(PIRP pIrp, PURB pUrb, BOOLEAN post,
                 packetHeader.info       = USBPCAP_INFO_PDO_TO_FDO;
 
                 packetHeader.bus        = pDeviceData->pRootData->busId;
-                packetHeader.device     = pDeviceData->deviceAddress;
+                packetHeader.device     = deviceAddress;
                 packetHeader.endpoint   = 0;
                 packetHeader.transfer   = USBPCAP_TRANSFER_UNKNOWN;
                 packetHeader.dataLength = 0;

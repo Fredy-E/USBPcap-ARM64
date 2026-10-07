@@ -96,6 +96,7 @@ static NTSTATUS USBPcapAllocateDeviceData(IN PDEVICE_EXTENSION pDevExt,
 
     if (pDeviceData != NULL)
     {
+        RtlZeroMemory(pDeviceData, sizeof(*pDeviceData));
         /* deviceAddress, port and isHub will be properly set up when
          * filter driver handles IRP_MN_START_DEVICE
          */
@@ -133,6 +134,8 @@ static NTSTATUS USBPcapAllocateDeviceData(IN PDEVICE_EXTENSION pDevExt,
                                       DKPORT_MTAG);
             if (pDeviceData->pRootData != NULL)
             {
+                RtlZeroMemory(pDeviceData->pRootData,
+                              sizeof(*pDeviceData->pRootData));
                 /* Initialize empty buffer */
                 KeInitializeSpinLock(&pDeviceData->pRootData->bufferLock);
                 pDeviceData->pRootData->buffer = NULL;
@@ -164,6 +167,11 @@ static NTSTATUS USBPcapAllocateDeviceData(IN PDEVICE_EXTENSION pDevExt,
         KeInitializeSpinLock(&pDeviceData->tablesSpinLock);
         pDeviceData->endpointTable = USBPcapInitializeEndpointTable(NULL);
         pDeviceData->URBIrpTable = USBPcapInitializeURBIRPInfoTable(NULL);
+        if (pDeviceData->endpointTable == NULL ||
+            pDeviceData->URBIrpTable == NULL)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
 
         pDeviceData->descriptor = NULL;
     }
@@ -204,12 +212,10 @@ static ULONG GetDeviceTypeToUse(PDEVICE_OBJECT pdo)
 
 /////////////////////////////////////////////////////////////////////
 // Functions to attach and detach USB Root HUB filter
-#pragma prefast(suppress: 28152, "Suppress 28152 for path where filter was not created. Please remove this suppression after doing any changes to AddDevice()!")
 NTSTATUS AddDevice(IN PDRIVER_OBJECT pDrvObj,
                    IN PDEVICE_OBJECT pTgtDevObj)
 {
     NTSTATUS          ntStat = STATUS_SUCCESS;
-    UNICODE_STRING    usTgtName;
     PDEVICE_OBJECT    pHubFilter = NULL;
     PDEVICE_EXTENSION pDevExt = NULL;
     BOOLEAN           isRootHub;
@@ -260,21 +266,20 @@ NTSTATUS AddDevice(IN PDRIVER_OBJECT pDrvObj,
     pHubFilter->Flags |=
         (pDevExt->pNextDevObj->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE));
 
-    pHubFilter->Flags &= ~DO_DEVICE_INITIALIZING;
-
     if (NT_SUCCESS(ntStat))
     {
         PDEVICE_OBJECT         control = NULL;
-        PUSBPCAP_ROOTHUB_DATA  pRootData;
-        USHORT                 id;
+        USHORT                 id = 0;
 
         ntStat = USBPcapCreateRootHubControlDevice(pDevExt,
                                                    &control,
                                                    &id);
 
-        pRootData = pDevExt->context.usb.pDeviceData->pRootData;
-        pRootData->controlDevice = control;
-        pRootData->busId = id;
+        if (NT_SUCCESS(ntStat))
+        {
+            /* Creation publishes fully initialized root/control fields. */
+            pHubFilter->Flags &= ~DO_DEVICE_INITIALIZING;
+        }
     }
 
 EndFunc:
@@ -282,6 +287,11 @@ EndFunc:
     // If something bad happened
     if (!NT_SUCCESS(ntStat))
     {
+        if (pDevExt != NULL && pDevExt->pNextDevObj != NULL)
+        {
+            IoDetachDevice(pDevExt->pNextDevObj);
+            pDevExt->pNextDevObj = NULL;
+        }
         USBPcapFreeDeviceData(pDevExt);
         if (pHubFilter)
         {
@@ -295,23 +305,24 @@ EndFunc:
 
 VOID DkDetachAndDeleteHubFilt(PDEVICE_EXTENSION pDevExt)
 {
-    NTSTATUS status;
-    if (pDevExt->parentRemoveLock)
-    {
-        IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
-    }
+    PDEVICE_OBJECT device = pDevExt->pThisDevObj;
 
     if (pDevExt->pNextDevObj)
     {
         IoDetachDevice(pDevExt->pNextDevObj);
         pDevExt->pNextDevObj = NULL;
     }
-    if (pDevExt->pThisDevObj)
-    {
-        IoDeleteDevice(pDevExt->pThisDevObj);
-        pDevExt->pThisDevObj = NULL;
-    }
     USBPcapFreeDeviceData(pDevExt);
+    pDevExt->pThisDevObj = NULL;
+    if (pDevExt->parentRemoveLock)
+    {
+        IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
+        pDevExt->parentRemoveLock = NULL;
+    }
+    if (device != NULL)
+    {
+        IoDeleteDevice(device);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -343,8 +354,15 @@ NTSTATUS DkCreateAndAttachTgt(PDEVICE_EXTENSION pParentDevExt, PDEVICE_OBJECT pT
     pDevExt = (PDEVICE_EXTENSION) pDeviceObject->DeviceExtension;
     pDevExt->deviceMagic = USBPCAP_MAGIC_DEVICE;
     pDevExt->pThisDevObj = pDeviceObject;
-    pDevExt->parentRemoveLock = &pParentDevExt->removeLock;
+    pDevExt->parentRemoveLock = NULL;
     pDevExt->pDrvObj = pParentDevExt->pDrvObj;
+
+    ntStat = IoAcquireRemoveLock(&pParentDevExt->removeLock, NULL);
+    if (!NT_SUCCESS(ntStat))
+    {
+        goto EndAttDev;
+    }
+    pDevExt->parentRemoveLock = &pParentDevExt->removeLock;
 
     ntStat = USBPcapAllocateDeviceData(pDevExt, pParentDevExt);
     if (!NT_SUCCESS(ntStat))
@@ -371,12 +389,20 @@ NTSTATUS DkCreateAndAttachTgt(PDEVICE_EXTENSION pParentDevExt, PDEVICE_OBJECT pT
         (pDevExt->pNextDevObj->Flags & (DO_BUFFERED_IO | DO_POWER_PAGABLE | DO_DIRECT_IO));
     pDevExt->pThisDevObj->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    IoAcquireRemoveLock(pDevExt->parentRemoveLock, NULL);
-
 EndAttDev:
     if (!NT_SUCCESS(ntStat))
     {
+        if (pDevExt->pNextDevObj != NULL)
+        {
+            IoDetachDevice(pDevExt->pNextDevObj);
+            pDevExt->pNextDevObj = NULL;
+        }
         USBPcapFreeDeviceData(pDevExt);
+        if (pDevExt->parentRemoveLock != NULL)
+        {
+            IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
+            pDevExt->parentRemoveLock = NULL;
+        }
         if (pDeviceObject)
         {
             IoDeleteDevice(pDeviceObject);
@@ -389,23 +415,24 @@ EndAttDev:
 
 VOID DkDetachAndDeleteTgt(PDEVICE_EXTENSION pDevExt)
 {
-    PUSBPCAP_DEVICE_DATA  pDeviceData = pDevExt->context.usb.pDeviceData;
+    PDEVICE_OBJECT device = pDevExt->pThisDevObj;
 
-    if (pDevExt->parentRemoveLock)
-    {
-        IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
-    }
     if (pDevExt->pNextDevObj)
     {
         IoDetachDevice(pDevExt->pNextDevObj);
         pDevExt->pNextDevObj = NULL;
     }
-    if (pDevExt->pThisDevObj)
-    {
-        IoDeleteDevice(pDevExt->pThisDevObj);
-        pDevExt->pThisDevObj = NULL;
-    }
     USBPcapFreeDeviceData(pDevExt);
+    pDevExt->pThisDevObj = NULL;
+    if (pDevExt->parentRemoveLock)
+    {
+        IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
+        pDevExt->parentRemoveLock = NULL;
+    }
+    if (device != NULL)
+    {
+        IoDeleteDevice(device);
+    }
 }
 
 
@@ -434,6 +461,12 @@ NTSTATUS DkGetHubDevName(PIO_STACK_LOCATION pStack, PIRP pIrp, PULONG pUlRes)
     usTgtDev.Length = 0;
     usTgtDev.MaximumLength = 512;
     usTgtDev.Buffer = (PWSTR) ExAllocatePoolWithTag(NonPagedPool, 512, DKPORT_MTAG);
+    if (usTgtDev.Buffer == NULL)
+    {
+        ZwClose(hObj);
+        *pUlRes = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlFillMemory(usTgtDev.Buffer, 512, '\0');
 
     ntStat = ZwQuerySymbolicLinkObject(hObj, &usTgtDev, &ulRet);

@@ -13,9 +13,10 @@ NTSTATUS DkPower(PDEVICE_OBJECT pDevObj, PIRP pIrp)
     PIO_STACK_LOCATION   pStack = NULL;
     PDEVICE_OBJECT       pNextDevObj = NULL;
     PCHAR                pTmp = NULL;
+    PVOID                removeTag = (PVOID)pIrp;
 
     pDevExt = (PDEVICE_EXTENSION) pDevObj->DeviceExtension;
-    ntStat = IoAcquireRemoveLock(&pDevExt->removeLock, (PVOID) pIrp);
+    ntStat = IoAcquireRemoveLock(&pDevExt->removeLock, removeTag);
     if (!NT_SUCCESS(ntStat))
     {
         DkDbgVal("Error acquire lock!", ntStat);
@@ -63,10 +64,13 @@ NTSTATUS DkPower(PDEVICE_OBJECT pDevObj, PIRP pIrp)
             break;
     }
 
-    if (pDevExt->pNextDevObj == NULL)
+    if (pNextDevObj == NULL)
     {
         ntStat = STATUS_INVALID_DEVICE_REQUEST;
+        /* Completion may consume the IRP. Keep the extension alive until it
+         * returns, then release using the tag captured before completion. */
         DkCompleteRequest(pIrp, ntStat, 0);
+        IoReleaseRemoveLock(&pDevExt->removeLock, removeTag);
         return ntStat;
     }
 
@@ -82,7 +86,7 @@ NTSTATUS DkPower(PDEVICE_OBJECT pDevObj, PIRP pIrp)
     ntStat = IoCallDriver(pNextDevObj, pIrp);
 #endif
 
-    IoReleaseRemoveLock(&pDevExt->removeLock, (PVOID) pIrp);
+    IoReleaseRemoveLock(&pDevExt->removeLock, removeTag);
 
     return ntStat;
 }

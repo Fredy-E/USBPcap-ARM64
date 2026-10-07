@@ -9,7 +9,7 @@
 #include "USBPcapRootHubControl.h"
 #include "Ntstrsafe.h"
 
-extern ULONG volatile g_controlId;
+extern LONG volatile g_controlId;
 
 #define NTNAME_PREFIX      L"\\Device\\USBPcap"
 #define SYMBOLIC_PREFIX    L"\\DosDevices\\USBPcap"
@@ -34,13 +34,25 @@ NTSTATUS USBPcapCreateRootHubControlDevice(IN PDEVICE_EXTENSION hubExt,
     PDEVICE_EXTENSION  controlExt = NULL;
     NTSTATUS           status;
     USHORT             id;
-    PWCHAR             ntNameBuffer[MAX_NTNAME_LEN];
-    PWCHAR             symbolicNameBuffer[MAX_SYMBOLIC_LEN];
+    LONG               nextId;
+    WCHAR              ntNameBuffer[MAX_NTNAME_LEN / sizeof(WCHAR)];
+    WCHAR              symbolicNameBuffer[MAX_SYMBOLIC_LEN / sizeof(WCHAR)];
+    PUSBPCAP_ROOTHUB_DATA rootData = hubExt->context.usb.pDeviceData->pRootData;
+    KIRQL irql;
+    BOOLEAN published = FALSE;
+
+    *control = NULL;
+    *busId = 0;
 
     ASSERT(hubExt->deviceMagic == USBPCAP_MAGIC_ROOTHUB);
 
     /* Acquire the control device ID */
-    id = (USHORT) InterlockedIncrement(&g_controlId);
+    nextId = InterlockedIncrement(&g_controlId);
+    if (nextId <= 0 || nextId > MAXUSHORT)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    id = (USHORT)nextId;
 
     ntDeviceName.Length = 0;
     ntDeviceName.MaximumLength = MAX_NTNAME_LEN;
@@ -81,14 +93,6 @@ NTSTATUS USBPcapCreateRootHubControlDevice(IN PDEVICE_EXTENSION hubExt,
     {
         controlDevice->Flags |= DO_DIRECT_IO;
 
-        status = IoCreateSymbolicLink(&symbolicLinkName, &ntDeviceName);
-
-        if (!NT_SUCCESS(status))
-        {
-            IoDeleteDevice(controlDevice);
-            KdPrint(("IoCreateSymbolicLink failed %x\n", status));
-            return status;
-        }
 
         controlExt = (PDEVICE_EXTENSION)controlDevice->DeviceExtension;
         controlExt->deviceMagic      = USBPCAP_MAGIC_CONTROL;
@@ -97,6 +101,12 @@ NTSTATUS USBPcapCreateRootHubControlDevice(IN PDEVICE_EXTENSION hubExt,
         controlExt->pDrvObj          = hubExt->pDrvObj;
 
         IoInitializeRemoveLock(&controlExt->removeLock, 0, 0, 0);
+        controlExt->parentRemoveLock = NULL;
+        status = IoAcquireRemoveLock(&hubExt->removeLock, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            goto End;
+        }
         controlExt->parentRemoveLock = &hubExt->removeLock;
 
         /* Initialize USBPcap control context */
@@ -106,8 +116,11 @@ NTSTATUS USBPcapCreateRootHubControlDevice(IN PDEVICE_EXTENSION hubExt,
 
 
         KeInitializeSpinLock(&controlExt->context.control.csqSpinLock);
+        KeInitializeMutex(&controlExt->context.control.captureMutex, 0);
+        controlExt->context.control.removing = FALSE;
+        controlExt->context.control.captureClosing = FALSE;
         InitializeListHead(&controlExt->context.control.lePendIrp);
-        status = IoCsqInitialize(&controlExt->context.control.ioCsq,
+        status = IoCsqInitializeEx(&controlExt->context.control.ioCsq,
                                  DkCsqInsertIrp, DkCsqRemoveIrp,
                                  DkCsqPeekNextIrp, DkCsqAcquireLock,
                                  DkCsqReleaseLock, DkCsqCompleteCanceledIrp);
@@ -117,6 +130,20 @@ NTSTATUS USBPcapCreateRootHubControlDevice(IN PDEVICE_EXTENSION hubExt,
             goto End;
         }
 
+        /* Root fields and parent reference precede any publication. */
+        KeAcquireSpinLock(&rootData->bufferLock, &irql);
+        rootData->controlDevice = controlDevice;
+        rootData->busId = id;
+        published = TRUE;
+        KeReleaseSpinLock(&rootData->bufferLock, irql);
+        status = IoCreateSymbolicLink(&symbolicLinkName, &ntDeviceName);
+        if (!NT_SUCCESS(status))
+        {
+            KeAcquireSpinLock(&rootData->bufferLock, &irql);
+            rootData->controlDevice = NULL;
+            KeReleaseSpinLock(&rootData->bufferLock, irql);
+            goto End;
+        }
         controlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
     }
     else
@@ -129,13 +156,31 @@ End:
     {
         if (controlDevice != NULL)
         {
-            IoDeleteSymbolicLink(&symbolicLinkName);
+            if (published)
+            {
+                /* A producer could have observed publication even while
+                 * DO_DEVICE_INITIALIZING still prevents user opens. Revoke
+                 * and wait for those transient owners before failure delete. */
+                KeAcquireSpinLock(&controlExt->context.control.csqSpinLock, &irql);
+                controlExt->context.control.removing = TRUE;
+                controlExt->context.control.captureClosing = TRUE;
+                KeReleaseSpinLock(&controlExt->context.control.csqSpinLock, irql);
+                DkCsqDrainQueue(&controlExt->context.control.ioCsq, NULL);
+                if (NT_SUCCESS(IoAcquireRemoveLock(&controlExt->removeLock, NULL)))
+                {
+                    IoReleaseRemoveLockAndWait(&controlExt->removeLock, NULL);
+                }
+            }
+            if (controlExt != NULL && controlExt->parentRemoveLock != NULL)
+            {
+                IoReleaseRemoveLock(controlExt->parentRemoveLock, NULL);
+                controlExt->parentRemoveLock = NULL;
+            }
             IoDeleteDevice(controlDevice);
         }
     }
     else
     {
-        IoAcquireRemoveLock(controlExt->parentRemoveLock, NULL);
         *control = controlDevice;
         *busId = id;
     }
@@ -147,10 +192,14 @@ End:
 VOID USBPcapDeleteRootHubControlDevice(IN PDEVICE_OBJECT controlDevice)
 {
     UNICODE_STRING     symbolicLinkName;
-    PWCHAR             symbolicNameBuffer[MAX_SYMBOLIC_LEN];
+    WCHAR              symbolicNameBuffer[MAX_SYMBOLIC_LEN / sizeof(WCHAR)];
     USHORT             id;
     PDEVICE_EXTENSION  pDevExt;
     NTSTATUS           status;
+    PDEVICE_EXTENSION rootExt;
+    PUSBPCAP_ROOTHUB_DATA rootData;
+    PIO_REMOVE_LOCK parentLock;
+    KIRQL irql;
 
     pDevExt = ((PDEVICE_EXTENSION)controlDevice->DeviceExtension);
 
@@ -165,23 +214,35 @@ VOID USBPcapDeleteRootHubControlDevice(IN PDEVICE_OBJECT controlDevice)
     status = RtlUnicodeStringPrintf(&symbolicLinkName,
                                     SYMBOLIC_PREFIX L"%hu", id);
 
-    IoAcquireRemoveLock(&pDevExt->removeLock, NULL);
-    IoReleaseRemoveLockAndWait(&pDevExt->removeLock, NULL);
-
-    IoReleaseRemoveLock(pDevExt->parentRemoveLock, NULL);
-
-    ASSERT(NT_SUCCESS(status));
+    if (!NT_SUCCESS(IoAcquireRemoveLock(&pDevExt->removeLock, NULL)))
+    {
+        return;
+    }
+    /* Serialize with passive state changes, close CSQ admission and revoke
+     * producer publication before drain/wait. No completion under locks. */
+    KeWaitForSingleObject(&pDevExt->context.control.captureMutex,
+                          Executive, KernelMode, FALSE, NULL);
+    KeAcquireSpinLock(&pDevExt->context.control.csqSpinLock, &irql);
+    pDevExt->context.control.removing = TRUE;
+    pDevExt->context.control.captureClosing = TRUE;
+    KeReleaseSpinLock(&pDevExt->context.control.csqSpinLock, irql);
+    rootExt = (PDEVICE_EXTENSION)pDevExt->context.control.pRootHubObject->DeviceExtension;
+    rootData = rootExt->context.usb.pDeviceData->pRootData;
+    KeAcquireSpinLock(&rootData->bufferLock, &irql);
+    rootData->controlDevice = NULL;
+    RtlZeroMemory(&rootData->filter, sizeof(rootData->filter));
+    KeReleaseSpinLock(&rootData->bufferLock, irql);
+    KeReleaseMutex(&pDevExt->context.control.captureMutex, FALSE);
     if (NT_SUCCESS(status))
     {
         IoDeleteSymbolicLink(&symbolicLinkName);
-        IoDeleteDevice(controlDevice);
     }
-    else
-    {
-        /* Very bad */
-        KdPrint(("Failed to init symbolic link name\n"));
-
-        pDevExt->context.control.pRootHubObject = NULL;
-    }
+    DkCsqDrainQueue(&pDevExt->context.control.ioCsq, NULL);
+    IoReleaseRemoveLockAndWait(&pDevExt->removeLock, NULL);
+    parentLock = pDevExt->parentRemoveLock;
+    pDevExt->parentRemoveLock = NULL;
+    pDevExt->context.control.pRootHubObject = NULL;
+    IoDeleteDevice(controlDevice);
+    IoReleaseRemoveLock(parentLock, NULL);
 }
 

@@ -186,7 +186,6 @@ static UINT32 USBPcapBufferRead(PUSBPCAP_ROOTHUB_DATA pData,
     else
     {
         UINT32 tmp;
-        UINT32 tmp2;
         tmp = pData->bufferSize - pData->readOffset;
 
         if (tmp >= toRead)
@@ -348,17 +347,16 @@ VOID USBPcapBufferRemoveBuffer(PDEVICE_EXTENSION pDevExt)
     pRootExt = (PDEVICE_EXTENSION)pDevExt->context.control.pRootHubObject->DeviceExtension;
     pData = pRootExt->context.usb.pDeviceData->pRootData;
 
-    if (pData->buffer == NULL)
-    {
-        return;
-    }
-
     /* Buffer found - free it */
     KeAcquireSpinLock(&pData->bufferLock, &irql);
     pData->readOffset = 0;
     pData->writeOffset = 0;
-    ExFreePool((PVOID)pData->buffer);
+    if (pData->buffer != NULL)
+    {
+        ExFreePool((PVOID)pData->buffer);
+    }
     pData->buffer = NULL;
+    pData->bufferSize = 0;
     KeReleaseSpinLock(&pData->bufferLock, irql);
 }
 
@@ -377,16 +375,14 @@ VOID USBPcapBufferInitializeBuffer(PDEVICE_EXTENSION pDevExt)
     pRootExt = (PDEVICE_EXTENSION)pDevExt->context.control.pRootHubObject->DeviceExtension;
     pData = pRootExt->context.usb.pDeviceData->pRootData;
 
-    if (pData->buffer == NULL)
-    {
-        return;
-    }
-
     /* Buffer found - reset all data and write global PCAP header */
     KeAcquireSpinLock(&pData->bufferLock, &irql);
-    pData->readOffset = 0;
-    pData->writeOffset = 0;
-    USBPcapWriteGlobalHeader(pData);
+    if (pData->buffer != NULL)
+    {
+        pData->readOffset = 0;
+        pData->writeOffset = 0;
+        USBPcapWriteGlobalHeader(pData);
+    }
     KeReleaseSpinLock(&pData->bufferLock, irql);
 }
 
@@ -394,13 +390,10 @@ NTSTATUS USBPcapBufferHandleReadIrp(PIRP pIrp,
                                     PDEVICE_EXTENSION pDevExt,
                                     PUINT32 pBytesRead)
 {
-    PDEVICE_EXTENSION      pRootExt;
-    PUSBPCAP_ROOTHUB_DATA  pRootData;
     PVOID                  buffer;
     UINT32                 bufferLength;
-    UINT32                 bytesRead;
     NTSTATUS               status;
-    KIRQL                  irql;
+    USBPCAP_READ_CONTEXT   context;
     PIO_STACK_LOCATION     pStack = NULL;
 
     pStack = IoGetCurrentIrpStackLocation(pIrp);
@@ -412,20 +405,18 @@ NTSTATUS USBPcapBufferHandleReadIrp(PIRP pIrp,
         return STATUS_SUCCESS;
     }
 
-    pRootExt = (PDEVICE_EXTENSION)pDevExt->context.control.pRootHubObject->DeviceExtension;
-    pRootData = pRootExt->context.usb.pDeviceData->pRootData;
-
-    if (pRootData->buffer == NULL)
-    {
-        return STATUS_UNSUCCESSFUL;
-    }
 
     /*
      * Since control device has DO_DIRECT_IO bit set the MDL is already
      * probed and locked
      */
+    if (pIrp->MdlAddress == NULL ||
+        pStack->Parameters.Read.Length > MmGetMdlByteCount(pIrp->MdlAddress))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
     buffer = MmGetSystemAddressForMdlSafe(pIrp->MdlAddress,
-                                          NormalPagePriority);
+                                          NormalPagePriority | MdlMappingNoExecute);
 
     if (buffer == NULL)
     {
@@ -433,87 +424,161 @@ NTSTATUS USBPcapBufferHandleReadIrp(PIRP pIrp,
     }
     else
     {
-        bufferLength = MmGetMdlByteCount(pIrp->MdlAddress);
+        bufferLength = pStack->Parameters.Read.Length;
     }
 
-    /* Get data from data queue, if there is no data we put
-     * this IRP to Cancel-Safe queue and return status pending
-     * otherwise complete this IRP then return SUCCESS
-     */
-    KeAcquireSpinLock(&pRootData->bufferLock, &irql);
-    bytesRead = USBPcapBufferRead(pRootData,
-                                  buffer, bufferLength);
-    *pBytesRead = bytesRead;
-    if (bytesRead == 0)
+    /* Dispatch retains its original acquisition through return. Completion
+     * owns the extra acquisition, including immediate CSQ cancellation. */
+    status = IoAcquireRemoveLock(&pDevExt->removeLock, pIrp);
+    if (!NT_SUCCESS(status))
     {
-        IoCsqInsertIrp(&pDevExt->context.control.ioCsq,
-                       pIrp, NULL);
-        KeReleaseSpinLock(&pRootData->bufferLock, irql);
-        return STATUS_PENDING;
+        return status;
     }
-
-    KeReleaseSpinLock(&pRootData->bufferLock, irql);
-    return STATUS_SUCCESS;
+    context.buffer = buffer;
+    context.length = bufferLength;
+    context.bytes = 0;
+    context.status = STATUS_SUCCESS;
+    context.queued = FALSE;
+    IoMarkIrpPending(pIrp);
+    status = IoCsqInsertIrpEx(&pDevExt->context.control.ioCsq,
+                             pIrp, NULL, &context);
+    if (!NT_SUCCESS(status))
+    {
+        /* Rejected inserts remain ours. Once marked, return pending even
+         * for synchronous data; never touch IRP after successful insertion. */
+        DkCsqCompleteRead(&pDevExt->context.control.ioCsq, pIrp,
+                          context.status, context.bytes);
+    }
+    return STATUS_PENDING;
 }
 
-/* called with pRootData->bufferLock held
- * releases pRootData->bufferLock before return
- */
-static void USBPcapBufferCompletePendedReadIrp(PUSBPCAP_ROOTHUB_DATA pRootData, KIRQL irql)
+/* Called with CSQ lock held; CSQ -> bufferLock is the only nested order.
+ * The atomic read-or-queue decision prevents a lost producer wakeup. */
+NTSTATUS USBPcapBufferReadOrQueue(PIO_CSQ pCsq, PIRP pIrp,
+                                 PUSBPCAP_READ_CONTEXT context)
 {
-    PDEVICE_EXTENSION  pControlExt;
-    PIRP               pIrp = NULL;
-    PVOID              buffer;
-    UINT32             bufferLength;
-    UINT32             bytes;
-
-    pControlExt = (PDEVICE_EXTENSION)pRootData->controlDevice->DeviceExtension;
-
-    ASSERT(pControlExt->deviceMagic == USBPCAP_MAGIC_CONTROL);
-
-    pIrp = IoCsqRemoveNextIrp(&pControlExt->context.control.ioCsq,
-                                  NULL);
-    if (pIrp == NULL)
+    PDEVICE_EXTENSION ext = CONTAINING_RECORD(pCsq, DEVICE_EXTENSION,
+                                              context.control.ioCsq);
+    PDEVICE_EXTENSION root;
+    PUSBPCAP_ROOTHUB_DATA data;
+    KIRQL irql;
+    context->queued = FALSE;
+    if (ext->context.control.removing || ext->context.control.captureClosing)
     {
-        KeReleaseSpinLock(&pRootData->bufferLock, irql);
-        return;
+        context->status = STATUS_CANCELLED;
+        return STATUS_UNSUCCESSFUL;
     }
-
-    /*
-     * Only IRPs with non-zero buffer are being queued.
-     *
-     * Since control device has DO_DIRECT_IO bit set the MDL is already
-     * probed and locked
-     */
-    buffer = MmGetSystemAddressForMdlSafe(pIrp->MdlAddress,
-                                          NormalPagePriority);
-
-    if (buffer == NULL)
+    root = (PDEVICE_EXTENSION)ext->context.control.pRootHubObject->DeviceExtension;
+    data = root->context.usb.pDeviceData->pRootData;
+    KeAcquireSpinLock(&data->bufferLock, &irql);
+    if (data->buffer == NULL)
     {
-        pIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-        bytes = 0;
+        context->status = STATUS_UNSUCCESSFUL;
     }
     else
     {
-        UINT32 bufferLength = MmGetMdlByteCount(pIrp->MdlAddress);
-
-        if (bufferLength != 0)
+        context->bytes = USBPcapBufferRead(data, context->buffer, context->length);
+        if (context->bytes == 0)
         {
-            bytes = USBPcapBufferRead(pRootData,
-                                      buffer, bufferLength);
+            InsertTailList(&ext->context.control.lePendIrp,
+                            &pIrp->Tail.Overlay.ListEntry);
+            context->queued = TRUE;
+            KeReleaseSpinLock(&data->bufferLock, irql);
+            return STATUS_SUCCESS;
         }
-        else
-        {
-            bytes = 0;
-        }
-
-        pIrp->IoStatus.Status = STATUS_SUCCESS;
     }
+    KeReleaseSpinLock(&data->bufferLock, irql);
+    return STATUS_UNSUCCESSFUL; /* caller completes outside locks */
+}
 
-    pIrp->IoStatus.Information = (ULONG_PTR) bytes;
-    /* release lock before completing the IRP! */
-    KeReleaseSpinLock(&pRootData->bufferLock, irql);
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+/* Caller retains one transient control remove-lock reference through the
+ * entire drain, with no driver lock held. Each dequeued read already owns
+ * its separate completion reference. Keep the private void API unchanged. */
+static void USBPcapBufferCompletePendedReadIrp(PUSBPCAP_ROOTHUB_DATA pRootData,
+                                              PDEVICE_EXTENSION pControlExt)
+{
+    PIRP pIrp;
+    PVOID buffer;
+    UINT32 bufferLength;
+    KIRQL irql;
+    BOOLEAN available;
+    USBPCAP_READ_CONTEXT context;
+    NTSTATUS insertStatus;
+
+    ASSERT(pControlExt->deviceMagic == USBPCAP_MAGIC_CONTROL);
+
+    for (;;)
+    {
+        /* A hint only: another reader may steal these bytes after unlock.
+         * Never call CSQ while holding bufferLock (CSQ -> buffer only). */
+        KeAcquireSpinLock(&pRootData->bufferLock, &irql);
+        available = pRootData->buffer != NULL &&
+                    USBPcapGetBufferAllocated(pRootData) != 0;
+        KeReleaseSpinLock(&pRootData->bufferLock, irql);
+        if (!available)
+        {
+            return;
+        }
+        pIrp = IoCsqRemoveNextIrp(&pControlExt->context.control.ioCsq, NULL);
+        if (pIrp == NULL)
+        {
+            return;
+        }
+
+        /* Only nonzero, validated direct-I/O reads enter the queue. Treat
+         * an unavailable mapping or invalid destination as failure, not
+         * successful zero-byte progress. Complete outside ALL driver locks. */
+        buffer = (pIrp->MdlAddress == NULL) ? NULL :
+            MmGetSystemAddressForMdlSafe(pIrp->MdlAddress,
+                                        NormalPagePriority | MdlMappingNoExecute);
+        if (buffer == NULL)
+        {
+            DkCsqCompleteRead(&pControlExt->context.control.ioCsq, pIrp,
+                              STATUS_INSUFFICIENT_RESOURCES, 0);
+            continue;
+        }
+        bufferLength = min(MmGetMdlByteCount(pIrp->MdlAddress),
+                           IoGetCurrentIrpStackLocation(pIrp)->Parameters.Read.Length);
+        if (bufferLength == 0)
+        {
+            DkCsqCompleteRead(&pControlExt->context.control.ioCsq, pIrp,
+                              STATUS_INVALID_PARAMETER, 0);
+            continue;
+        }
+
+        /* Reuse the atomic admission/read-or-queue callback even when the
+         * hint says data is available. It checks cleanup/removal under CSQ
+         * lock before reading under bufferLock. No extra pending acquisition.
+         * Successful insertion may cancel/complete before it returns; inspect
+         * only stack context afterwards, never the transferred IRP. */
+        context.buffer = buffer;
+        context.length = bufferLength;
+        context.bytes = 0;
+        context.status = STATUS_SUCCESS;
+        context.queued = FALSE;
+        insertStatus = IoCsqInsertIrpEx(&pControlExt->context.control.ioCsq,
+                                       pIrp, NULL, &context);
+        if (!NT_SUCCESS(insertStatus))
+        {
+            DkCsqCompleteRead(&pControlExt->context.control.ioCsq, pIrp,
+                              context.status, context.bytes);
+            if (context.bytes == 0)
+            {
+                /* Admission closed or buffer removed; teardown drains the
+                 * other reads. No manufactured successful empty completion. */
+                return;
+            }
+        }
+        else if (context.queued)
+        {
+            /* Actual empty-buffer outcome, not the earlier hint. A stealing
+             * reader must not cause us to dequeue/requeue this IRP forever.
+             * A concurrent later producer performs its own service pass. */
+            return;
+        }
+        /* Consumed data or immediate cancellation (no callback/queue).
+         * Continue until data or eligible queued readers are exhausted. */
+    }
 }
 
 __inline static VOID
@@ -553,6 +618,11 @@ USBPcapBufferStorePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
     pcaprec_hdr_t      pcapHeader;
     int                i;
 
+    if (header == NULL || header->headerLen < sizeof(*header) ||
+        header->dataLength > MAXULONG - header->headerLen)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
     bytes = header->headerLen + header->dataLength;
 
     USBPcapInitializePcapHeader(pRootData, timestamp, &pcapHeader, bytes);
@@ -561,9 +631,14 @@ USBPcapBufferStorePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
     bytes = pcapHeader.incl_len;
 
     /* Sanity check payload entries */
-    if (bytes > (sizeof(pcaprec_hdr_t) + header->headerLen))
+    if (bytes > header->headerLen)
     {
-        UINT32 bytesMissing = bytes - (sizeof(pcaprec_hdr_t) + header->headerLen);
+        UINT32 bytesMissing = bytes - header->headerLen;
+
+        if (payloadEntries == NULL)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
 
         for (i = 0; (bytesMissing > 0) && (payloadEntries[i].buffer); i++)
         {
@@ -625,16 +700,27 @@ NTSTATUS USBPcapBufferWriteTimestampedPayload(PUSBPCAP_ROOTHUB_DATA pRootData,
 {
     KIRQL                  irql;
     NTSTATUS               status;
+    PDEVICE_EXTENSION      controlExt = NULL;
 
     KeAcquireSpinLock(&pRootData->bufferLock, &irql);
     status = USBPcapBufferStorePacket(pRootData, timestamp, header, payload);
     if (NT_SUCCESS(status))
     {
-        USBPcapBufferCompletePendedReadIrp(pRootData, irql);
+        if (pRootData->controlDevice != NULL)
+        {
+            controlExt = (PDEVICE_EXTENSION)pRootData->controlDevice->DeviceExtension;
+            if (!NT_SUCCESS(IoAcquireRemoveLock(&controlExt->removeLock,
+                                                &controlExt)))
+            {
+                controlExt = NULL;
+            }
+        }
     }
-    else
+    KeReleaseSpinLock(&pRootData->bufferLock, irql);
+    if (controlExt != NULL)
     {
-        KeReleaseSpinLock(&pRootData->bufferLock, irql);
+        USBPcapBufferCompletePendedReadIrp(pRootData, controlExt);
+        IoReleaseRemoveLock(&controlExt->removeLock, &controlExt);
     }
 
     return status;

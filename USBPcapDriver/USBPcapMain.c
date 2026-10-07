@@ -8,11 +8,11 @@
 
 /* Control device ID, used when creating roothub control devices
  *
- * Although this is 32-bit value (ULONG) we use only lower 16 bits
+ * This is a signed 32-bit interlocked counter; control IDs fit in 16 bits.
  * The reason for that is lack of InterlockedIncrement16 when building
  * for x86 processors
  */
-ULONG volatile g_controlId;
+LONG volatile g_controlId;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT pDrvObj, PUNICODE_STRING pUsRegPath)
 {
@@ -48,7 +48,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDrvObj, PUNICODE_STRING pUsRegPath)
 
     pDrvObj->MajorFunction[IRP_MJ_POWER]                    = DkPower;
 
-    g_controlId = (ULONG)0;
+    g_controlId = 0;
 
     return STATUS_SUCCESS;
 }

@@ -15,7 +15,6 @@ NTSTATUS DkCreateClose(PDEVICE_OBJECT pDevObj, PIRP pIrp)
     NTSTATUS              ntStat = STATUS_SUCCESS;
     PDEVICE_EXTENSION     pDevExt = NULL;
     PIO_STACK_LOCATION    pStack = NULL;
-    PDEVICE_OBJECT        pNextDevObj = NULL;
 
     pDevExt = (PDEVICE_EXTENSION) pDevObj->DeviceExtension;
 
@@ -40,6 +39,17 @@ NTSTATUS DkCreateClose(PDEVICE_OBJECT pDevObj, PIRP pIrp)
     else if (pDevExt->deviceMagic == USBPCAP_MAGIC_CONTROL)
     {
         // Handling Create, Close and Cleanup request for this object
+        KIRQL irql;
+        BOOLEAN drain = FALSE;
+        KeWaitForSingleObject(&pDevExt->context.control.captureMutex,
+                              Executive, KernelMode, FALSE, NULL);
+        if (pDevExt->context.control.removing)
+        {
+            KeReleaseMutex(&pDevExt->context.control.captureMutex, FALSE);
+            DkCompleteRequest(pIrp, STATUS_DELETE_PENDING, 0);
+            IoReleaseRemoveLock(&pDevExt->removeLock, pIrp);
+            return STATUS_DELETE_PENDING;
+        }
         switch (pStack->MajorFunction)
         {
             case IRP_MJ_CREATE:
@@ -54,12 +64,18 @@ NTSTATUS DkCreateClose(PDEVICE_OBJECT pDevObj, PIRP pIrp)
                  */
                 if (pStack->Parameters.Create.SecurityContext->DesiredAccess & (READ_CONTROL | FILE_READ_DATA))
                 {
-                    PFILE_OBJECT *previous;
+                    PFILE_OBJECT previous;
                     previous = InterlockedCompareExchangePointer(&pDevExt->context.control.pCaptureObject, pStack->FileObject, NULL);
                     if (previous)
                     {
                         /* There is another handle that has the READ access - fail this one */
                         ntStat = STATUS_ACCESS_DENIED;
+                    }
+                    else
+                    {
+                        KeAcquireSpinLock(&pDevExt->context.control.csqSpinLock, &irql);
+                        pDevExt->context.control.captureClosing = FALSE;
+                        KeReleaseSpinLock(&pDevExt->context.control.csqSpinLock, irql);
                     }
                 }
                 else
@@ -74,11 +90,16 @@ NTSTATUS DkCreateClose(PDEVICE_OBJECT pDevObj, PIRP pIrp)
                 {
                     PDEVICE_EXTENSION     rootExt;
                     PUSBPCAP_ROOTHUB_DATA pRootData;
-                    DkCsqCleanUpQueue(pDevObj, pIrp);
+                    KeAcquireSpinLock(&pDevExt->context.control.csqSpinLock, &irql);
+                    pDevExt->context.control.captureClosing = TRUE;
+                    KeReleaseSpinLock(&pDevExt->context.control.csqSpinLock, irql);
+                    drain = TRUE;
                     /* Stop filtering */
                     rootExt = (PDEVICE_EXTENSION)pDevExt->context.control.pRootHubObject->DeviceExtension;
                     pRootData = (PUSBPCAP_ROOTHUB_DATA)rootExt->context.usb.pDeviceData->pRootData;
+                    KeAcquireSpinLock(&pRootData->bufferLock, &irql);
                     memset(&pRootData->filter, 0, sizeof(USBPCAP_ADDRESS_FILTER));
+                    KeReleaseSpinLock(&pRootData->bufferLock, irql);
                     /* Free the buffer allocated for this device. */
                     USBPcapBufferRemoveBuffer(pDevExt);
                 }
@@ -96,6 +117,11 @@ NTSTATUS DkCreateClose(PDEVICE_OBJECT pDevObj, PIRP pIrp)
                 break;
         }
 
+        KeReleaseMutex(&pDevExt->context.control.captureMutex, FALSE);
+        if (drain)
+        {
+            DkCsqCleanUpQueue(pDevObj, pIrp);
+        }
         DkCompleteRequest(pIrp, ntStat, 0);
     }
 
@@ -168,7 +194,9 @@ NTSTATUS DkReadWrite(PDEVICE_OBJECT pDevObj, PIRP pIrp)
                 break;
         }
 
-        /* If the IRP was pended, do not call complete request */
+        /* The read helper acquired a separate completion-owned remove lock
+         * before CSQ insertion. This dispatch's original acquisition must
+         * still be released below, including immediate cancellation. */
         if (ntStat != STATUS_PENDING)
         {
             DkCompleteRequest(pIrp, ntStat, (ULONG_PTR)bytesRead);

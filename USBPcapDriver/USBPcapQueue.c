@@ -7,7 +7,7 @@
 #include "USBPcapMain.h"
 #include "USBPcapQueue.h"
 
-VOID DkCsqInsertIrp(__in PIO_CSQ pCsq, __in PIRP pIrp)
+NTSTATUS DkCsqInsertIrp(__in PIO_CSQ pCsq, __in PIRP pIrp, __in PVOID context)
 {
     PDEVICE_EXTENSION   pDevExt = NULL;
 
@@ -16,17 +16,14 @@ VOID DkCsqInsertIrp(__in PIO_CSQ pCsq, __in PIRP pIrp)
 
     ASSERT(pDevExt->deviceMagic == USBPCAP_MAGIC_CONTROL);
 
-    InsertTailList(&pDevExt->context.control.lePendIrp,
-                   &pIrp->Tail.Overlay.ListEntry);
+    return USBPcapBufferReadOrQueue(pCsq, pIrp,
+                                    (PUSBPCAP_READ_CONTEXT)context);
 }
 
 VOID DkCsqRemoveIrp(__in PIO_CSQ pCsq, __in PIRP pIrp)
 {
-    BOOLEAN  bRes = FALSE;
-
     UNREFERENCED_PARAMETER(pCsq);
-
-    bRes = RemoveEntryList(&pIrp->Tail.Overlay.ListEntry);
+    RemoveEntryList(&pIrp->Tail.Overlay.ListEntry);
 }
 
 PIRP DkCsqPeekNextIrp(__in PIO_CSQ pCsq, __in PIRP pIrp, __in PVOID pCtx)
@@ -103,18 +100,36 @@ VOID DkCsqReleaseLock(__in PIO_CSQ pCsq, __in __drv_in(__drv_restoresIRQL) KIRQL
 
 VOID DkCsqCompleteCanceledIrp(__in PIO_CSQ pCsq, __in PIRP pIrp)
 {
-    UNREFERENCED_PARAMETER(pCsq);
+    DkCsqCompleteRead(pCsq, pIrp, STATUS_CANCELLED, 0);
+}
 
-    pIrp->IoStatus.Status = STATUS_CANCELLED;
-    pIrp->IoStatus.Information = 0;
+/* Exactly one CSQ owner calls this, with neither driver spinlock held.
+ * The extra read acquisition remains held through IoCompleteRequest. */
+VOID DkCsqCompleteRead(PIO_CSQ pCsq, PIRP pIrp, NTSTATUS status, ULONG_PTR bytes)
+{
+    PDEVICE_EXTENSION ext = CONTAINING_RECORD(pCsq, DEVICE_EXTENSION,
+                                              context.control.ioCsq);
+    PVOID tag = pIrp;
+    pIrp->IoStatus.Status = status;
+    pIrp->IoStatus.Information = bytes;
     IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+    IoReleaseRemoveLock(&ext->removeLock, tag);
+}
+
+VOID DkCsqDrainQueue(PIO_CSQ pCsq, PFILE_OBJECT fileObject)
+{
+    PIRP irp;
+    while ((irp = IoCsqRemoveNextIrp(pCsq, fileObject)) != NULL)
+    {
+        DkCsqCompleteCanceledIrp(pCsq, irp);
+    }
 }
 
 VOID DkCsqCleanUpQueue(PDEVICE_OBJECT pDevObj, PIRP pIrp)
 {
     PIO_STACK_LOCATION  pStack = NULL;
     PDEVICE_EXTENSION   pDevExt = NULL;
-    PIRP                pPendIrp = NULL;
+
 
     pDevExt = (PDEVICE_EXTENSION) pDevObj->DeviceExtension;
 
@@ -122,19 +137,6 @@ VOID DkCsqCleanUpQueue(PDEVICE_OBJECT pDevObj, PIRP pIrp)
 
     pStack = IoGetCurrentIrpStackLocation(pIrp);
 
-    while (TRUE)
-    {
-        pPendIrp = IoCsqRemoveNextIrp(&pDevExt->context.control.ioCsq,
-                                      (PVOID)pStack->FileObject);
-        if (pPendIrp == NULL)
-        {
-            break;
-        }
-        else
-        {
-            DkCsqCompleteCanceledIrp(&pDevExt->context.control.ioCsq,
-                                     pPendIrp);
-        }
-    }
+    DkCsqDrainQueue(&pDevExt->context.control.ioCsq, pStack->FileObject);
 }
 
