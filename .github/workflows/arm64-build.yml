@@ -1,0 +1,106 @@
+# CI for the USBPcap ARM64 port.
+#
+# Stage 1 (strict): static build-contract tests — pure stdlib, no compiler needed.
+# Stage 2 (informational for now): environment diagnostics + toolchain prerequisite
+# check + a Release build attempt. These steps are marked continue-on-error while the
+# hosted-runner toolchain story is being brought up; they will be made strict once green.
+#
+# Scope note: build-only. No driver install/load, no signing, no hardware access.
+
+name: ARM64 build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts-and-toolchain:
+    name: Static contracts + ARM64 toolchain probe
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Environment diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '== python =='
+          python --version
+          python -c "import platform,sys; print(sys.version); print('machine:', platform.machine())"
+          Write-Host '== Visual Studio installs =='
+          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio','C:\Program Files (x86)\Microsoft Visual Studio' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            Write-Host '== vswhere (all products) =='
+            & $vswhere -all -prerelease -products * -format value -property installationPath
+            Write-Host '== vswhere (VC tools) =='
+            & $vswhere -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -format value -property installationPath
+          } else { Write-Host 'vswhere not found' }
+          Write-Host '== MSBuild (arm64) candidates =='
+          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe','C:\Program Files (x86)\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Host '== VC Tools versions =='
+          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Host '== package managers (for possible toolchain install step) =='
+          foreach ($tool in 'choco','winget') { $c = Get-Command $tool -ErrorAction SilentlyContinue; if ($c) { Write-Host "$tool -> $($c.Source)" } else { Write-Host "$tool -> not found" } }
+
+      - name: Restore pinned SDK/WDK packages (nuget.org)
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
+          .\nuget.exe restore build/arm64/packages.config -PackagesDirectory packages -Source https://api.nuget.org/v3/index.json -NonInteractive
+          Write-Host '== restored packages =='
+          Get-ChildItem packages -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+
+      - name: Static build-contract tests (strict)
+        run: python build/arm64/build.py --static-only
+
+      - name: Locate ARM64 MSBuild
+        id: locate
+        shell: pwsh
+        run: |
+          $candidates = @()
+          $candidates += Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe' -ErrorAction SilentlyContinue
+          $candidates += Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe' -ErrorAction SilentlyContinue
+          $msbuild = $candidates | Select-Object -First 1
+          if ($msbuild) {
+            $vsroot = ($msbuild.FullName -replace '\\MSBuild\\Current\\Bin\\arm64\\MSBuild\.exe$','')
+            "VS_ROOT=$vsroot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "MSBUILD_PATH=$($msbuild.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "VS root: $vsroot"
+            Write-Host "MSBuild: $($msbuild.FullName)"
+          } else {
+            Write-Host 'No ARM64 MSBuild found in standard locations'
+            "MSBUILD_PATH=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Toolchain prerequisite check (informational)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
+          python build/arm64/build.py --check-only --vs-root "$env:VS_ROOT" --msbuild "$env:MSBUILD_PATH"
+
+      - name: Build Release (informational while toolchain is being brought up)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
+          python build/arm64/build.py --configuration Release --vs-root "$env:VS_ROOT" --msbuild "$env:MSBUILD_PATH"
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-logs
+          path: artifacts/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
