@@ -132,7 +132,7 @@ static void EnumerateHub(PTSTR hub,
                          PUSB_NODE_CONNECTION_INFORMATION connection_info,
                          ULONG level,
                          EnumDeviceInfoCallback callback,
-                         EnumConnectedPortCallback port_callback, void *port_ctx);
+                         EnumConnectedPortCallback port_callback, void *port_ctx, DWORD *error);
 
 static void print_indent(ULONG level)
 {
@@ -197,6 +197,7 @@ static PTSTR WideStrToMultiStr(__in LPCWSTR WideStr)
     RetStr = GlobalAlloc(GPTR, nChars * sizeof(TCHAR));
     if (RetStr == NULL)
     {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
 
@@ -212,6 +213,7 @@ static PTSTR WideStrToMultiStr(__in LPCWSTR WideStr)
 
     if (nBytes == 0)
     {
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
         return NULL;
     }
 
@@ -220,6 +222,7 @@ static PTSTR WideStrToMultiStr(__in LPCWSTR WideStr)
 
     if (MultiStr == NULL)
     {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
 
@@ -230,6 +233,7 @@ static PTSTR WideStrToMultiStr(__in LPCWSTR WideStr)
     if (nBytes == 0)
     {
         GlobalFree(MultiStr);
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
         return NULL;
     }
 
@@ -260,6 +264,7 @@ void print_extcap_config(ULONG level, ULONG port, TCHAR display[MAX_DEVICE_ID_LE
 {
     PTSTR str = WideStrToUTF8((LPCWSTR)display);
 
+    if (str == NULL) return;
     if (node)
     {
         printf("value {arg=%d}{value=%d_%d}{display=%s}{enabled=false}",
@@ -372,7 +377,7 @@ GetDriverKeyNameError:
     return NULL;
 }
 
-static PTSTR GetExternalHubName(HANDLE Hub, ULONG ConnectionIndex)
+static PTSTR GetExternalHubName(HANDLE Hub, ULONG ConnectionIndex, DWORD *error)
 {
     BOOL                        success;
     ULONG                       nBytes;
@@ -415,6 +420,7 @@ static PTSTR GetExternalHubName(HANDLE Hub, ULONG ConnectionIndex)
 
     if (extHubNameW == NULL)
     {
+        *error = ERROR_NOT_ENOUGH_MEMORY;
         OOPS();
         goto GetExternalHubNameError;
     }
@@ -439,6 +445,7 @@ static PTSTR GetExternalHubName(HANDLE Hub, ULONG ConnectionIndex)
 
     // Convert the External Hub name
     extHubNameA = WideStrToMultiStr(extHubNameW->NodeName);
+    if (extHubNameA == NULL) *error = GetLastError();
 
     // All done, free the uncoverted external hub name and return the
     // converted external hub name
@@ -546,7 +553,7 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
     {
         current = next;
         level++;
-        stack_push(&nodeStack, parentNode);
+        if (!stack_push(&nodeStack, parentNode)) goto children_cleanup;
     }
 
     /* Do depth-first iteration over all children and get their
@@ -558,7 +565,7 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
         if ((++sanityCounter) > LOOP_SANITY_LIMIT)
         {
             fprintf(stderr, "Sanity check failed in PrintDevinstChildren()\n");
-            return;
+            goto children_cleanup;
         }
         len = sizeof(buf) / sizeof(buf[0]);
         cr = CM_Get_DevNode_Registry_PropertyW(current,
@@ -596,7 +603,7 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
         {
             current = next;
             level++;
-            stack_push(&nodeStack, nextNode);
+            if (!stack_push(&nodeStack, nextNode)) goto children_cleanup;
             nextNode++;
             continue;
         }
@@ -627,23 +634,25 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
                     if (current == parent || level == indent)
                     {
                         /* We went back to the parent, explicitly return here */
-                        return;
+                        goto children_cleanup;
                     }
                 }
                 else
                 {
                     while (TRUE == stack_pop(&nodeStack, &parentNode));
                     /* Nothing left to do */
-                    return;
+                    goto children_cleanup;
                 }
             }
             else
             {
                 fprintf(stderr, "CM_Get_Sibling() returned 0x%08X\n", cr);
-                return;
+                goto children_cleanup;
             }
         }
     }
+children_cleanup:
+    while (stack_pop(&nodeStack, &parentNode)) { /* Release remaining ancestors. */ }
 }
 
 VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
@@ -782,7 +791,7 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
 static VOID
 EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
                   USHORT hubAddress, EnumDeviceInfoCallback print_callback,
-                  EnumConnectedPortCallback port_callback, void *port_ctx)
+                  EnumConnectedPortCallback port_callback, void *port_ctx, DWORD *error)
 {
     ULONG       index;
     BOOL        success;
@@ -792,7 +801,7 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
     // Loop over all ports of the hub.
     //
     // Port indices are 1 based, not 0 based.
-    for (index=1; index <= NumPorts; index++)
+    for (index=1; index <= NumPorts && *error == ERROR_SUCCESS; index++)
     {
         USB_NODE_CONNECTION_INFORMATION    connectionInfo;
         ULONG                               nBytes;
@@ -847,7 +856,7 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
                 PTSTR extHubName;
 
                 extHubName = GetExternalHubName(hHubDevice,
-                                                index);
+                                                index, error);
 
                 if (extHubName != NULL)
                 {
@@ -856,7 +865,7 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
                                  level+1,
                                  print_callback,
                                  port_callback,
-                                 port_ctx);
+                                 port_ctx, error);
                     GlobalFree(extHubName);
                 }
             }
@@ -869,7 +878,7 @@ static void EnumerateHub(PTSTR hub,
                          PUSB_NODE_CONNECTION_INFORMATION connection_info,
                          ULONG level,
                          EnumDeviceInfoCallback print_callback,
-                         EnumConnectedPortCallback port_callback, void *port_ctx)
+                         EnumConnectedPortCallback port_callback, void *port_ctx, DWORD *error)
 {
     PUSB_NODE_INFORMATION   hubInfo;
     HANDLE                  hHubDevice;
@@ -883,11 +892,19 @@ static void EnumerateHub(PTSTR hub,
     hubInfo     = NULL;
     hHubDevice  = INVALID_HANDLE_VALUE;
 
+    if (*error != ERROR_SUCCESS) return;
+    if (hub == NULL)
+    {
+        *error = ERROR_INVALID_PARAMETER;
+        return;
+    }
+
     // Allocate some space for a USB_NODE_INFORMATION structure for this Hub
     hubInfo = (PUSB_NODE_INFORMATION)GlobalAlloc(GPTR, sizeof(USB_NODE_INFORMATION));
 
     if (hubInfo == NULL)
     {
+        *error = ERROR_NOT_ENOUGH_MEMORY;
         OOPS();
         goto EnumerateHubError;
     }
@@ -898,6 +915,7 @@ static void EnumerateHub(PTSTR hub,
 
     if (deviceName == NULL)
     {
+        *error = ERROR_NOT_ENOUGH_MEMORY;
         OOPS();
         goto EnumerateHubError;
     }
@@ -959,7 +977,7 @@ static void EnumerateHub(PTSTR hub,
                       hubInfo->u.HubInformation.HubDescriptor.bNumberOfPorts,
                       level,
                       (connection_info == NULL) ? 0 : connection_info->DeviceAddress,
-                      print_callback, port_callback, port_ctx);
+                      print_callback, port_callback, port_ctx, error);
 
 EnumerateHubError:
     // Clean up any stuff that got allocated
@@ -1038,8 +1056,13 @@ void enumerate_print_usbpcap_interactive(const char *filter)
         printf("\n");
 
         str = WideStrToMultiStr(outBuf);
-        EnumerateHub(str, NULL, 0, print_usbpcapcmd, NULL, NULL);
-        GlobalFree(str);
+        if (str != NULL)
+        {
+            DWORD error = ERROR_SUCCESS;
+            EnumerateHub(str, NULL, 0, print_usbpcapcmd, NULL, NULL, &error);
+            GlobalFree(str);
+            SetLastError(error);
+        }
     }
 }
 
@@ -1054,23 +1077,42 @@ void enumerate_print_extcap_config(const char *filter)
         PTSTR str;
 
         str = WideStrToMultiStr(outBuf);
-        EnumerateHub(str, NULL, 0, print_extcap_config, NULL, NULL);
-        GlobalFree(str);
+        if (str != NULL)
+        {
+            DWORD error = ERROR_SUCCESS;
+            EnumerateHub(str, NULL, 0, print_extcap_config, NULL, NULL, &error);
+            GlobalFree(str);
+            SetLastError(error);
+        }
     }
 }
 
+/* FALSE means required discovery preparation failed. Empty discovery and
+ * unavailable optional port/name queries remain successful omissions. */
+BOOL enumerate_all_connected_devices_checked(const char *filter, EnumConnectedPortCallback cb, void *ctx)
+{
+    WCHAR outBuf[IOCTL_OUTPUT_BUFFER_SIZE];
+    DWORD bytes_ret;
+    DWORD error = ERROR_SUCCESS;
+    PTSTR str;
+
+    SetLastError(ERROR_SUCCESS);
+    bytes_ret = get_usbpcap_filter_hub_symlink(filter, outBuf, sizeof(outBuf)/sizeof(outBuf[0]));
+    if (bytes_ret == 0)
+    {
+        error = GetLastError();
+        return error == ERROR_SUCCESS;
+    }
+    str = WideStrToMultiStr(outBuf);
+    if (str == NULL) return FALSE;
+    EnumerateHub(str, NULL, 0, NULL, cb, ctx, &error);
+    GlobalFree(str);
+    SetLastError(error);
+    return error == ERROR_SUCCESS;
+}
+
+/* Retain the historical public API for callers not requiring failure status. */
 void enumerate_all_connected_devices(const char *filter, EnumConnectedPortCallback cb, void *ctx)
 {
-    WCHAR  outBuf[IOCTL_OUTPUT_BUFFER_SIZE];
-    DWORD  bytes_ret;
-
-    bytes_ret = get_usbpcap_filter_hub_symlink(filter, &outBuf[0], sizeof(outBuf)/sizeof(outBuf[0]));
-    if (bytes_ret > 0)
-    {
-        PTSTR str;
-
-        str = WideStrToMultiStr(outBuf);
-        EnumerateHub(str, NULL, 0, NULL, cb, ctx);
-        GlobalFree(str);
-    }
+    (void)enumerate_all_connected_devices_checked(filter, cb, ctx);
 }

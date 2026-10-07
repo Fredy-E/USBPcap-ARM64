@@ -52,6 +52,7 @@ static BOOL IsElevated()
                 if (ERROR_SUCCESS == RegOpenKey(HKEY_USERS, "S-1-5-19", &key))
                 {
                     fRet = TRUE;
+                    RegCloseKey(key);
                 }
                 else
                 {
@@ -269,181 +270,205 @@ EXTERN_C int WINAPI GetModuleFullName(__in HMODULE hModule, __out LPWSTR pszBuff
  *
  * \return BOOL TRUE on success, FALSE otherwise.
  */
+/* Windows CRT argv escaping, not shell escaping. Bound every UTF-16 append
+ * before allocation or writing; 32767 includes the terminating NUL. */
+#define WORKER_COMMAND_CAPACITY 32767U
+static BOOL worker_put(PWSTR buffer, size_t *used, WCHAR ch)
+{
+    if (*used >= WORKER_COMMAND_CAPACITY - 1)
+    {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return FALSE;
+    }
+    if (buffer != NULL) buffer[*used] = ch;
+    ++*used;
+    return TRUE;
+}
+
+static BOOL worker_text(PWSTR buffer, size_t *used, PCWSTR text)
+{
+    while (*text)
+    {
+        if (!worker_put(buffer, used, *text++)) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL worker_quote(PWSTR buffer, size_t *used, PCWSTR text)
+{
+    size_t slashes;
+    size_t i;
+    if (!worker_put(buffer, used, L'"')) return FALSE;
+    for (;;)
+    {
+        slashes = 0;
+        while (*text == L'\\') { ++slashes; ++text; }
+        /* Backslashes before a quote or the closing quote must be doubled. */
+        for (i = 0; i < slashes; ++i)
+        {
+            if (!worker_put(buffer, used, L'\\')) return FALSE;
+            if ((*text == L'"' || *text == L'\0') &&
+                !worker_put(buffer, used, L'\\')) return FALSE;
+        }
+        if (*text == L'\0') break;
+        if (*text == L'"' && !worker_put(buffer, used, L'\\')) return FALSE;
+        if (!worker_put(buffer, used, *text++)) return FALSE;
+    }
+    return worker_put(buffer, used, L'"');
+}
+
+static PWSTR worker_widen(const char *text)
+{
+    int count;
+    PWSTR wide;
+    if (text == NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    count = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+    if (count <= 0) return NULL;
+    if ((unsigned int)count > WORKER_COMMAND_CAPACITY)
+    {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return NULL;
+    }
+    wide = (PWSTR)malloc((size_t)count * sizeof(WCHAR));
+    if (wide == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_ACP, 0, text, -1, wide, count) != count)
+    {
+        DWORD error = GetLastError();
+        free(wide);
+        SetLastError(error ? error : ERROR_NO_UNICODE_TRANSLATION);
+        return NULL;
+    }
+    return wide;
+}
+
+static BOOL worker_parameters(struct thread_data *data, PCWSTR device,
+                               PCWSTR output, PCWSTR addresses,
+                               PWSTR buffer, size_t *used)
+{
+    WCHAR number[11]; /* UINT32 decimal digits plus NUL. */
+    if (!worker_text(buffer, used, L"-d ") ||
+        !worker_quote(buffer, used, device) ||
+        !worker_text(buffer, used, L" -b ")) return FALSE;
+    if (swprintf_s(number, _countof(number), L"%u", data->bufferlen) < 0 ||
+        !worker_text(buffer, used, number) ||
+        !worker_text(buffer, used, L" -o ") ||
+        !worker_quote(buffer, used, output)) return FALSE;
+    if (data->snaplen != DEFAULT_SNAPSHOT_LENGTH)
+    {
+        if (swprintf_s(number, _countof(number), L"%u", data->snaplen) < 0 ||
+            !worker_text(buffer, used, L" -s ") ||
+            !worker_text(buffer, used, number)) return FALSE;
+    }
+    if (addresses != NULL &&
+        (!worker_text(buffer, used, L" --devices ") ||
+         !worker_quote(buffer, used, addresses))) return FALSE;
+    if (data->capture_all && !worker_text(buffer, used, L" --capture-from-all-devices")) return FALSE;
+    if (data->capture_new && !worker_text(buffer, used, L" --capture-from-new-devices")) return FALSE;
+    if (data->inject_descriptors && !worker_text(buffer, used, L" --inject-descriptors")) return FALSE;
+    return TRUE;
+}
+
 static BOOL generate_worker_command_line(struct thread_data *data,
                                          PWSTR *appPath,
                                          PWSTR *appCmdLine,
                                          HANDLE *pcap_handle)
 {
-    PWSTR exePath;
-    int exePathLen;
+    PWSTR exePath = NULL;
     PWSTR cmdLine = NULL;
-    int cmdLineLen;
     PWSTR pipeName = NULL;
-    int nChars;
+    PWSTR device = NULL;
+    PWSTR output = NULL;
+    PWSTR addresses = NULL;
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    int exePathLen;
+    int actualLength;
+    size_t used = 0;
+    size_t count;
+    size_t i;
+    DWORD error;
+    const WCHAR prefix[] = L"\\\\.\\pipe\\";
 
+    *appPath = NULL;
+    *appCmdLine = NULL;
     *pcap_handle = INVALID_HANDLE_VALUE;
-
     exePathLen = GetModuleFullName(NULL, NULL, 0, NULL);
-    exePath = (WCHAR *)malloc(exePathLen * sizeof(WCHAR));
-
-    if (exePath == NULL)
-    {
-        fprintf(stderr, "Failed to get module path\n");
-        return FALSE;
-    }
-
-    GetModuleFullName(NULL, exePath, exePathLen, NULL);
-
-    if (strncmp(data->filename, "-", 2) == 0)
-    {
-        /* Need to create pipe */
-        WCHAR *tmp;
-        int nChars = sizeof("\\\\.\\pipe\\") + strlen(data->device) + 1;
-        pipeName = malloc((nChars + 1) * sizeof(WCHAR));
-        if (pipeName == NULL)
-        {
-            fprintf(stderr, "Failed to allocate pipe name\n");
-            free(exePath);
-            return FALSE;
-        }
-        swprintf_s(pipeName, nChars,  L"\\\\.\\pipe\\%S", data->device);
-        for (tmp = &pipeName[sizeof("\\\\.\\pipe\\")]; *tmp; tmp++)
-        {
-            if (*tmp == L'\\')
-            {
-                *tmp = L'_';
-            }
-        }
-
-        *pcap_handle = CreateNamedPipeW(pipeName,
-                                        /* Pipe is used for elevated worker -> caller process communication.
-                                         * It is full duplex to allow caller to notice elevated worker that
-                                         * it should terminate (read from this pipe in elevated worker will
-                                         * result in ERROR_BROKEN_PIPE).
-                                         */
-                                        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                        2 /* Max instances of pipe */,
-                                        data->bufferlen, data->bufferlen,
-                                        0, NULL);
-
-
-        if (*pcap_handle == INVALID_HANDLE_VALUE)
-        {
-            fprintf(stderr, "Failed to create named pipe - %d\n", GetLastError());
-            free(exePath);
-            free(pipeName);
-            return FALSE;
-        }
-    }
-    else
-    {
-        *pcap_handle = INVALID_HANDLE_VALUE;
-    }
-
-#define WORKER_CMD_LINE_FORMATTER             L"-d %S -b %u -o %S"
-#define WORKER_CMD_LINE_FORMATTER_PIPE        L"-d %S -b %u -o %s"
-
-#define WORKER_CMD_LINE_FORMATTER_SNAPLEN     L" -s %u"
-#define WORKER_CMD_LINE_FORMATTER_DEVICES     L" --devices %S"
-#define WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL L" --capture-from-all-devices"
-#define WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW L" --capture-from-new-devices"
-#define WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS L" --inject-descriptors"
-
-    cmdLineLen = MultiByteToWideChar(CP_ACP, 0, data->device, -1, NULL, 0);
-    cmdLineLen += (pipeName == NULL) ? strlen(data->filename) : wcslen(pipeName);
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER);
-    cmdLineLen += 9 /* maximum bufferlen in characters */;
-    cmdLineLen += 1 /* NULL termination */;
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_SNAPLEN);
-    cmdLineLen += 10 /* maximum snaplen in characters */;
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_DEVICES);
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL);
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW);
-    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS);
-    cmdLineLen += (data->address_list == NULL) ? 0 : strlen(data->address_list);
-
-    cmdLine = (PWSTR)malloc(cmdLineLen * sizeof(WCHAR));
-
-    if (cmdLine == NULL)
-    {
-        fprintf(stderr, "Failed to allocate command line\n");
-        free(exePath);
-        free(pipeName);
-        return FALSE;
-    }
-
-    if (pipeName == NULL)
-    {
-        nChars = swprintf_s(cmdLine,
-                            cmdLineLen,
-                            WORKER_CMD_LINE_FORMATTER,
-                            data->device,
-                            data->bufferlen,
-                            data->filename);
-    }
-    else
-    {
-        nChars = swprintf_s(cmdLine,
-                            cmdLineLen,
-                            WORKER_CMD_LINE_FORMATTER_PIPE,
-                            data->device,
-                            data->bufferlen,
-                            pipeName);
-    }
-
-    if (data->snaplen != DEFAULT_SNAPSHOT_LENGTH)
-    {
-        nChars += swprintf_s(&cmdLine[nChars],
-                             cmdLineLen - nChars,
-                             WORKER_CMD_LINE_FORMATTER_SNAPLEN,
-                             data->snaplen);
-    }
-
+    if (exePathLen <= 0 || (unsigned int)exePathLen > WORKER_COMMAND_CAPACITY) goto failed;
+    exePath = (PWSTR)malloc((size_t)exePathLen * sizeof(WCHAR));
+    if (exePath == NULL) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); goto failed; }
+    actualLength = GetModuleFullName(NULL, exePath, exePathLen, NULL);
+    if (actualLength <= 0 || actualLength >= exePathLen) goto failed;
+    device = worker_widen(data->device);
+    output = worker_widen(data->filename);
+    if (device == NULL || output == NULL) goto failed;
     if (data->address_list != NULL)
     {
-        nChars += swprintf_s(&cmdLine[nChars],
-                             cmdLineLen - nChars,
-                             WORKER_CMD_LINE_FORMATTER_DEVICES,
-                             data->address_list);
+        addresses = worker_widen(data->address_list);
+        if (addresses == NULL) goto failed;
     }
-
-    if (data->capture_all)
+    if (strcmp(data->filename, "-") == 0)
     {
-        nChars += swprintf_s(&cmdLine[nChars],
-                             cmdLineLen - nChars,
-                             WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL);
+        count = wcslen(device) + _countof(prefix);
+        if (count > WORKER_COMMAND_CAPACITY) { SetLastError(ERROR_BUFFER_OVERFLOW); goto failed; }
+        pipeName = (PWSTR)malloc(count * sizeof(WCHAR));
+        if (pipeName == NULL) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); goto failed; }
+        memcpy(pipeName, prefix, sizeof(prefix) - sizeof(WCHAR));
+        memcpy(pipeName + _countof(prefix) - 1, device, (wcslen(device) + 1) * sizeof(WCHAR));
+        for (i = _countof(prefix) - 1; pipeName[i]; ++i)
+        {
+            if (pipeName[i] == L'\\') pipeName[i] = L'_';
+        }
     }
-
-    if (data->capture_new)
+    if (!worker_parameters(data, device, pipeName ? pipeName : output, addresses, NULL, &used)) goto failed;
+    count = used + 1;
+    /* Account for quoted argv[0], space and NUL in the CreateProcess sibling. */
+    if (count > WORKER_COMMAND_CAPACITY - 3 ||
+        wcslen(exePath) > WORKER_COMMAND_CAPACITY - count - 3)
     {
-        nChars += swprintf_s(&cmdLine[nChars],
-                             cmdLineLen - nChars,
-                             WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW);
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        goto failed;
     }
-
-    if (data->inject_descriptors)
+    cmdLine = (PWSTR)malloc(count * sizeof(WCHAR));
+    if (cmdLine == NULL) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); goto failed; }
+    used = 0;
+    if (!worker_parameters(data, device, pipeName ? pipeName : output, addresses, cmdLine, &used)) goto failed;
+    cmdLine[used] = L'\0';
+    /* Create the pipe only after every fallible allocation/conversion. */
+    if (pipeName != NULL)
     {
-        nChars += swprintf_s(&cmdLine[nChars],
-                             cmdLineLen - nChars,
-                             WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS);
+        pipe = CreateNamedPipeW(pipeName,
+                                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                2, data->bufferlen, data->bufferlen, 0, NULL);
+        if (pipe == INVALID_HANDLE_VALUE) goto failed;
     }
-#undef WORKER_CMD_LINE_FORMATTER_PIPE
-#undef WORKER_CMD_LINE_FORMATTER
-
-#undef WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS
-#undef WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW
-#undef WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL
-#undef WORKER_CMD_LINE_FORMATTER_DEVICES
-#undef WORKER_CMD_LINE_FORMATTER_SNAPLEN
-
+    free(device);
+    free(output);
+    free(addresses);
     free(pipeName);
-
     *appPath = exePath;
     *appCmdLine = cmdLine;
+    *pcap_handle = pipe;
     return TRUE;
+failed:
+    error = GetLastError();
+    free(exePath);
+    free(cmdLine);
+    free(device);
+    free(output);
+    free(addresses);
+    free(pipeName);
+    if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    SetLastError(error ? error : ERROR_INVALID_DATA);
+    return FALSE;
 }
-
 /**
  *  Creates elevated worker process.
  *
@@ -500,7 +525,8 @@ static HANDLE create_breakaway_worker_in_job(struct thread_data *data, PWSTR app
     STARTUPINFOW startupInfo;
     PROCESS_INFORMATION processInfo;
     PWSTR processCmdLine;
-    int nChars;
+    size_t nChars;
+    BOOL worker_failed = FALSE;
 
     if (data->job_handle == INVALID_HANDLE_VALUE)
     {
@@ -519,6 +545,14 @@ static HANDLE create_breakaway_worker_in_job(struct thread_data *data, PWSTR app
      *
      * Hence create new string that will contain "appPath" appCmdLine.
      */
+    /* Check lengths before adding, and reject invalid argv[0] quoting. */
+    if (appPath == NULL || appCmdLine == NULL || wcschr(appPath, L'\"') != NULL ||
+        wcslen(appPath) > WORKER_COMMAND_CAPACITY - 4 ||
+        wcslen(appCmdLine) > WORKER_COMMAND_CAPACITY - 4 - wcslen(appPath))
+    {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return INVALID_HANDLE_VALUE;
+    }
     nChars = wcslen(appPath) + wcslen(appCmdLine) +
              4 /* Two quotemarks, one space and NULL-terminator */;
     processCmdLine = (PWSTR)malloc(nChars * sizeof(WCHAR));
@@ -528,8 +562,13 @@ static HANDLE create_breakaway_worker_in_job(struct thread_data *data, PWSTR app
         return INVALID_HANDLE_VALUE;
     }
 
-    swprintf_s(processCmdLine, nChars, L"\"%s\" %s",
-               appPath, appCmdLine);
+    if (swprintf_s(processCmdLine, nChars, L"\"%s\" %s",
+                   appPath, appCmdLine) < 0)
+    {
+        free(processCmdLine);
+        SetLastError(ERROR_INVALID_DATA);
+        return INVALID_HANDLE_VALUE;
+    }
 
     /* We need to breakaway from parent job and assign to data->job_handle. */
     if (0 == CreateProcessW(NULL, processCmdLine, NULL, NULL, FALSE,
@@ -549,23 +588,76 @@ static HANDLE create_breakaway_worker_in_job(struct thread_data *data, PWSTR app
         {
             fprintf(stderr, "Failed to Assign process to job object - %d\n",
                     GetLastError());
-            /* This is fatal error. */
+            worker_failed = TRUE;
+        }
+        else if (ResumeThread(data->worker_process_thread) == (DWORD)-1)
+        {
+            fprintf(stderr, "Failed to resume worker process: %lu\n", GetLastError());
+            worker_failed = TRUE;
+        }
+
+        if (worker_failed)
+        {
+            BOOL termination_requested = FALSE;
+            DWORD joined;
+            /* Keep both handles and the local process owner until a confirmed
+             * process signal. A termination request is asynchronous; failure
+             * must be retried rather than followed by an infinite active-child
+             * wait. Permanent failure intentionally cannot complete cleanup. */
+            do
+            {
+                if (!termination_requested)
+                {
+                    termination_requested = TerminateProcess(process, 1);
+                    if (!termination_requested)
+                    {
+                        fprintf(stderr, "Failed to terminate suspended worker: %lu\n", GetLastError());
+                    }
+                }
+                joined = WaitForSingleObject(process, 100);
+                if (joined != WAIT_OBJECT_0)
+                {
+                    if (joined == WAIT_FAILED)
+                    {
+                        fprintf(stderr, "Suspended worker join failed; retaining ownership: %lu\n", GetLastError());
+                    }
+                    else if (joined != WAIT_TIMEOUT)
+                    {
+                        fprintf(stderr, "Unexpected suspended worker wait result; retaining ownership: %lu\n", joined);
+                    }
+                    Sleep(100);
+                }
+            } while (joined != WAIT_OBJECT_0);
             CloseHandle(process);
             CloseHandle(data->worker_process_thread);
             data->process = FALSE;
             process = INVALID_HANDLE_VALUE;
             data->worker_process_thread = INVALID_HANDLE_VALUE;
         }
-        else
-        {
-            /* Process is assigned to proper job. Resume it. */
-            ResumeThread(data->worker_process_thread);
-        }
     }
 
     free(processCmdLine);
 
     return process;
+}
+
+static BOOL replace_owned_argument(char **target, const char *text)
+{
+    char *copy;
+    if (text == NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    copy = _strdup(text);
+    if (copy == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    free(*target);
+    *target = copy;
+    return TRUE;
 }
 
 int cmd_interactive(struct thread_data *data)
@@ -611,6 +703,11 @@ int cmd_interactive(struct thread_data *data)
     data->inject_descriptors = TRUE;
 
     filters_initialize();
+    if (usbpcapFilters == NULL)
+    {
+        fprintf(stderr, "Failed to enumerate filter control devices.\n");
+        return -1;
+    }
     if (usbpcapFilters[0] == NULL)
     {
         printf("No filter control devices are available.\n");
@@ -645,6 +742,11 @@ int cmd_interactive(struct thread_data *data)
                     restart_all_usb_devices();
                     filters_free();
                     filters_initialize();
+                    if (usbpcapFilters == NULL || usbpcapFilters[0] == NULL)
+                    {
+                        filters_free();
+                        return -1;
+                    }
                 }
                 else if (buffer[0] == 'n')
                 {
@@ -690,7 +792,11 @@ int cmd_interactive(struct thread_data *data)
                 }
                 else
                 {
-                    data->device = _strdup(usbpcapFilters[value-1]->device);
+                    if (!replace_owned_argument(&data->device, usbpcapFilters[value-1]->device))
+                    {
+                        filters_free();
+                        return -1;
+                    }
                     finished = TRUE;
                 }
             }
@@ -725,7 +831,11 @@ int cmd_interactive(struct thread_data *data)
                     break;
                 }
             }
-            data->filename = _strdup(buffer);
+            if (!replace_owned_argument(&data->filename, buffer))
+            {
+                filters_free();
+                return -1;
+            }
             finished = TRUE;
         }
     } while (finished == FALSE);
@@ -749,9 +859,11 @@ static void wait_for_exit_signal(struct thread_data *data, HANDLE process)
     HANDLE stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
     DWORD dw;
     int count = 0;
+    DWORD console_mode;
 
-    /* Verify that stdin_handle can be used. */
-    if ((stdin_handle != NULL) && (stdin_handle != INVALID_HANDLE_VALUE))
+    /* ReadConsoleInput requires console input; redirected EOF would spin. */
+    if ((stdin_handle != NULL) && (stdin_handle != INVALID_HANDLE_VALUE) &&
+        GetConsoleMode(stdin_handle, &console_mode))
     {
         dw = WaitForSingleObject(stdin_handle, 0);
         if (dw != WAIT_FAILED)
@@ -776,14 +888,15 @@ static void wait_for_exit_signal(struct thread_data *data, HANDLE process)
     if (count == 0)
     {
         fprintf(stderr, "Nothing to wait for in wait_for_exit_signal().\n");
+        return;
     }
 
     /* Wait for exit condition. */
-    while (data->process == TRUE)
+    while (InterlockedCompareExchange(&data->process, FALSE, FALSE) != FALSE)
     {
         dw = WaitForMultipleObjects(count, handle_table, FALSE, INFINITE);
 #pragma warning(default : 4296)
-        if ((dw >= WAIT_OBJECT_0) && dw < (WAIT_OBJECT_0 + count))
+        if (dw < (WAIT_OBJECT_0 + (DWORD)count))
         {
             int i = dw - WAIT_OBJECT_0;
             if (handle_table[i] == stdin_handle)
@@ -824,12 +937,98 @@ static void wait_for_exit_signal(struct thread_data *data, HANDLE process)
     }
 }
 
+static HANDLE create_capture_output(struct thread_data *data)
+{
+    HANDLE handle;
+    BOOL pipe = (_strnicmp(data->filename, "\\\\.\\pipe\\", 9) == 0);
+    DWORD access = pipe ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_WRITE;
+    data->write_handle_owned = FALSE;
+    data->monitor_write_handle = FALSE;
+    if (strncmp("-", data->filename, 2) == 0)
+    {
+        return GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+    handle = CreateFileA(data->filename, access, 0, NULL,
+                         pipe ? OPEN_EXISTING : CREATE_NEW,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    if ((handle == INVALID_HANDLE_VALUE) && pipe && (GetLastError() == ERROR_ACCESS_DENIED))
+    {
+        /* Receive-only extcap pipes still work, without a read probe. */
+        access = GENERIC_WRITE;
+        handle = CreateFileA(data->filename, access, 0, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    }
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        data->write_handle_owned = TRUE;
+        data->monitor_write_handle = pipe && ((access & GENERIC_READ) != 0);
+    }
+    return handle;
+}
+
+/* Called only after worker join; stdout remains owned by the CRT/caller. */
+static void close_capture_handles(struct thread_data *data)
+{
+    if ((data->read_handle != NULL) && (data->read_handle != INVALID_HANDLE_VALUE))
+    {
+        CloseHandle(data->read_handle);
+    }
+    if (data->write_handle_owned && (data->write_handle != NULL) &&
+        (data->write_handle != INVALID_HANDLE_VALUE))
+    {
+        CloseHandle(data->write_handle);
+    }
+    data->read_handle = INVALID_HANDLE_VALUE;
+    data->write_handle = INVALID_HANDLE_VALUE;
+    data->write_handle_owned = FALSE;
+    data->monitor_write_handle = FALSE;
+}
+
+/* Return only after the owned process is signaled. The capture running flag
+ * is not a child-lifetime flag: stopping capture does not authorize closing
+ * process/thread/job handles. Permanent join failure keeps this call pending. */
+static void wait_for_worker_process_exit(HANDLE process, BOOL terminate_worker)
+{
+    BOOL termination_requested = FALSE;
+    DWORD joined;
+    do
+    {
+        if (terminate_worker && !termination_requested)
+        {
+            termination_requested = TerminateProcess(process, 0);
+            if (!termination_requested)
+            {
+                fprintf(stderr, "Failed to terminate worker; retaining ownership: %lu\n", GetLastError());
+            }
+        }
+        joined = WaitForSingleObject(process, 100);
+        if (joined != WAIT_OBJECT_0)
+        {
+            if (joined == WAIT_FAILED)
+            {
+                fprintf(stderr, "Worker join failed; retaining ownership: %lu\n", GetLastError());
+            }
+            else if (joined != WAIT_TIMEOUT)
+            {
+                fprintf(stderr, "Unexpected worker wait result; retaining ownership: %lu\n", joined);
+            }
+            Sleep(100);
+        }
+    } while (joined != WAIT_OBJECT_0);
+}
+
 static void start_capture(struct thread_data *data)
 {
     HANDLE pipe_handle = INVALID_HANDLE_VALUE;
     HANDLE process = INVALID_HANDLE_VALUE;
     HANDLE thread = NULL;
+    BOOL terminate_worker = FALSE;
     DWORD thread_id;
+
+    data->read_handle = INVALID_HANDLE_VALUE;
+    data->write_handle = INVALID_HANDLE_VALUE;
+    data->write_handle_owned = FALSE;
+    data->monitor_write_handle = FALSE;
 
     /* Sanity check capture configuration. */
     if ((data->capture_all == FALSE) &&
@@ -852,34 +1051,43 @@ static void start_capture(struct thread_data *data)
                                    FALSE, /* Default to not signalled */
                                    NULL);
 
+    if (data->exit_event == NULL)
+    {
+        fprintf(stderr, "Failed to create capture shutdown event: %lu\n", GetLastError());
+        data->exit_event = INVALID_HANDLE_VALUE;
+        InterlockedExchange(&data->process, FALSE);
+        return;
+    }
+
     memset(&data->descriptors, 0, sizeof(data->descriptors));
 
     if (IsElevated() == TRUE)
     {
         data->read_handle = INVALID_HANDLE_VALUE;
-        if (strncmp("-", data->filename, 2) == 0)
+        data->write_handle = create_capture_output(data);
+        if ((data->write_handle == NULL) || (data->write_handle == INVALID_HANDLE_VALUE))
         {
-            data->write_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        }
-        else
-        {
-            data->write_handle = CreateFileA(data->filename,
-                                             GENERIC_WRITE,
-                                             0,
-                                             NULL,
-                                             CREATE_NEW,
-                                             FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED,
-                                             NULL);
+            fprintf(stderr, "Failed to open capture output: %lu\n", GetLastError());
+            goto capture_finish;
         }
 
         if (data->inject_descriptors)
         {
             data->descriptors.descriptors = descriptors_generate_pcap(data->device, &data->descriptors.descriptors_len,
                                                                       &data->filter);
+            if (data->descriptors.descriptors == NULL && GetLastError() != ERROR_SUCCESS)
+            {
+                fprintf(stderr, "Failed to prepare descriptor packets: %lu\n", GetLastError());
+                goto capture_finish;
+            }
             data->descriptors.buf_written = 0;
         }
 
         data->read_handle = create_filter_read_handle(data);
+        if (data->read_handle == INVALID_HANDLE_VALUE)
+        {
+            goto capture_finish;
+        }
 
         thread = CreateThread(NULL, /* default security attributes */
                               0,    /* use default stack size */
@@ -956,7 +1164,8 @@ static void start_capture(struct thread_data *data)
                 {
                     fprintf(stderr, "Failed to query job information - %d\n", GetLastError());
                     /* This is fatal error. */
-                    exit(-1);
+                    data->process = FALSE;
+                    goto worker_cleanup;
                 }
 
                 if (info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
@@ -992,12 +1201,17 @@ static void start_capture(struct thread_data *data)
                         fprintf(stderr, "Failed to create job object!\n");
                         data->process = FALSE;
                         data->job_handle = INVALID_HANDLE_VALUE;
-                        return;
+                        goto worker_cleanup;
                     }
 
                     memset(&info, 0, sizeof(info));
                     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                    SetInformationJobObject(data->job_handle, JobObjectExtendedLimitInformation, &info, sizeof(info));
+                    if (!SetInformationJobObject(data->job_handle, JobObjectExtendedLimitInformation, &info, sizeof(info)))
+                    {
+                        fprintf(stderr, "Failed to configure worker job: %lu\n", GetLastError());
+                        data->process = FALSE;
+                        goto worker_cleanup;
+                    }
                 }
 
                 /* If breakaway is not needed for worker process, then assign ourselves to newly created job.
@@ -1010,7 +1224,8 @@ static void start_capture(struct thread_data *data)
                         fprintf(stderr, "Failed to Assign process to job object - %d\n",
                                 GetLastError());
                         /* This is fatal error. */
-                        exit(-1);
+                        data->process = FALSE;
+                        goto worker_cleanup;
                     }
                 }
             }
@@ -1025,6 +1240,7 @@ static void start_capture(struct thread_data *data)
                 process = create_breakaway_worker_in_job(data, appPath, appCmdLine);
             }
 
+worker_cleanup:
             /* Free worker path and command line strings as these are no longer needed. */
             free(appPath);
             free(appCmdLine);
@@ -1044,6 +1260,12 @@ static void start_capture(struct thread_data *data)
                                           data,
                                           0,    /* use default creation flag */
                                           &thread_id);
+                    pipe_handle = INVALID_HANDLE_VALUE; /* ownership transferred */
+                    if (thread == NULL)
+                    {
+                        fprintf(stderr, "Failed to create relay thread: %lu\n", GetLastError());
+                        data->process = FALSE;
+                    }
                 }
                 else
                 {
@@ -1066,16 +1288,14 @@ static void start_capture(struct thread_data *data)
     }
 
     wait_for_exit_signal(data, process);
-    data->process = FALSE;
-    if (data->exit_event != INVALID_HANDLE_VALUE)
-    {
-        SetEvent(data->exit_event);
-    }
+capture_finish:
+    request_capture_stop(data);
 
     /* If we created worker thread, wait for it to terminate. */
     if (thread != NULL)
     {
-        WaitForSingleObject(thread, INFINITE);
+        stop_capture_thread(data, thread);
+        CloseHandle(thread);
     }
 
     /* Closing read and write handles will terminate worker process. */
@@ -1088,30 +1308,34 @@ static void start_capture(struct thread_data *data)
          */
         if (process != INVALID_HANDLE_VALUE)
         {
-            TerminateProcess(process, 0);
+            terminate_worker = TRUE;
         }
     }
 
-    if (data->read_handle != INVALID_HANDLE_VALUE)
+    close_capture_handles(data);
+    if (pipe_handle != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(data->read_handle);
-    }
-
-    if (data->write_handle != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(data->write_handle);
+        CloseHandle(pipe_handle);
     }
 
     /* If we created worker process, wait for it to terminate. */
     if (process != INVALID_HANDLE_VALUE)
     {
-        WaitForSingleObject(process, INFINITE);
+        wait_for_worker_process_exit(process, terminate_worker);
         CloseHandle(process);
+        process = INVALID_HANDLE_VALUE;
+        if (data->worker_process_thread != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(data->worker_process_thread);
+            data->worker_process_thread = INVALID_HANDLE_VALUE;
+        }
     }
 
     if (data->descriptors.descriptors)
     {
         descriptors_free_pcap(data->descriptors.descriptors);
+        data->descriptors.descriptors = NULL;
+        data->descriptors.descriptors_len = 0;
     }
 }
 
@@ -1124,6 +1348,11 @@ static void print_extcap_interfaces(void)
 {
     int i = 0;
     filters_initialize();
+    if (usbpcapFilters == NULL)
+    {
+        fprintf(stderr, "Failed to enumerate extcap interfaces.\n");
+        return;
+    }
 
     while (usbpcapFilters[i] != NULL)
     {
@@ -1230,16 +1459,11 @@ int cmd_extcap(struct thread_data *data)
             return -1;
         }
 
-        if (data->device != NULL)
+        if (!replace_owned_argument(&data->device, extcap_interface) ||
+            !replace_owned_argument(&data->filename, extcap_fifo))
         {
-            free(data->device);
+            return -1;
         }
-        data->device = _strdup(extcap_interface);
-        if (data->filename != NULL)
-        {
-            free(data->filename);
-        }
-        data->filename = _strdup(extcap_fifo);
         data->process = TRUE;
 
         data->read_handle = INVALID_HANDLE_VALUE;
@@ -1411,6 +1635,8 @@ int __cdecl main(int argc, CHAR **argv)
     data.worker_process_thread = INVALID_HANDLE_VALUE;
     data.read_handle = INVALID_HANDLE_VALUE;
     data.write_handle = INVALID_HANDLE_VALUE;
+    data.write_handle_owned = FALSE;
+    data.monitor_write_handle = FALSE;
     data.exit_event = INVALID_HANDLE_VALUE;
 
     while (-1 != (c = getopt_long(argc, argv, "hd:o:s:b:IA", long_options, &option_index)))
@@ -1426,13 +1652,13 @@ int __cdecl main(int argc, CHAR **argv)
             case 'd': /* --device */
 #pragma warning(push)
 #pragma warning(disable:28193)
-                data.device = _strdup(optarg);
+                if (!replace_owned_argument(&data.device, optarg)) goto cmd_cleanup;
 #pragma warning(pop)
                 break;
             case 'o': /* --output */
 #pragma warning(push)
 #pragma warning(disable:28193)
-                data.filename = _strdup(optarg);
+                if (!replace_owned_argument(&data.filename, optarg)) goto cmd_cleanup;
 #pragma warning(pop)
                 break;
             case 's': /* --snaplen */
@@ -1493,7 +1719,7 @@ int __cdecl main(int argc, CHAR **argv)
 
     if (data.snaplen > (data.bufferlen - sizeof(pcaprec_hdr_t)))
     {
-        fprintf(stderr, "Packets larger than %u bytes won't be captured due to too small buffer.\n",
+        fprintf(stderr, "Packets larger than %zu bytes won't be captured due to too small buffer.\n",
                 data.bufferlen - sizeof(pcaprec_hdr_t));
     }
 
@@ -1530,6 +1756,7 @@ int __cdecl main(int argc, CHAR **argv)
         }
     }
 
+cmd_cleanup:
     /* Clean up */
     if (data.device != NULL)
     {

@@ -5,6 +5,7 @@
  */
 
 #include <stdlib.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <Windows.h>
@@ -31,6 +32,7 @@ typedef struct _descriptor_callback_context
     PUSBPCAP_ADDRESS_FILTER addresses;
     list_entry *head;
     list_entry *tail;
+    BOOL failed; /* Sticky: never publish a partial descriptor sequence. */
 } descriptor_callback_context;
 
 /* Get ddescriptor for given device
@@ -45,6 +47,7 @@ typedef struct _descriptor_callback_context
 static PUSB_DESCRIPTOR_REQUEST get_config_descriptor(HANDLE hub, ULONG port, UCHAR index)
 {
     ULONG nBytes = 0;
+    SetLastError(ERROR_SUCCESS);
     ULONG nBytesReturned = 0;
     UCHAR buffer[sizeof(USB_DESCRIPTOR_REQUEST) + sizeof(USB_CONFIGURATION_DESCRIPTOR)];
     PUSB_DESCRIPTOR_REQUEST request = NULL;
@@ -93,8 +96,10 @@ static PUSB_DESCRIPTOR_REQUEST get_config_descriptor(HANDLE hub, ULONG port, UCH
     request = (PUSB_DESCRIPTOR_REQUEST)malloc(nBytes);
     if (!request)
     {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    memset(request, 0, nBytes);
 
     descriptor = (PUSB_CONFIGURATION_DESCRIPTOR)(request->Data);
     request->ConnectionIndex = port;
@@ -152,7 +157,21 @@ static void initialize_control_header(PUSBPCAP_BUFFER_CONTROL_HEADER hdr,
 
 static void add_to_list(descriptor_callback_context *ctx, void *data, int length)
 {
-    list_entry *new_tail = (list_entry*)malloc(sizeof(list_entry));
+    list_entry *new_tail;
+    /* Consumes data on both success and failure; callers must not free it. */
+    if (ctx->failed || data == NULL || length <= 0)
+    {
+        ctx->failed = TRUE;
+        free(data);
+        return;
+    }
+    new_tail = (list_entry*)malloc(sizeof(list_entry));
+    if (new_tail == NULL)
+    {
+        ctx->failed = TRUE;
+        free(data);
+        return;
+    }
     new_tail->data = data;
     new_tail->length = length;
     new_tail->next = NULL;
@@ -199,7 +218,14 @@ static void write_setup_packet(descriptor_callback_context *ctx,
     int data_len = sizeof(USBPCAP_BUFFER_CONTROL_HEADER) + 8;
     UINT8 *data = (UINT8*)malloc(data_len);
     PUSBPCAP_BUFFER_CONTROL_HEADER hdr = (PUSBPCAP_BUFFER_CONTROL_HEADER)data;
-    UINT8 *setup = &data[sizeof(USBPCAP_BUFFER_CONTROL_HEADER)];
+    UINT8 *setup;
+    if (ctx->failed || data == NULL)
+    {
+        ctx->failed = TRUE;
+        free(data);
+        return;
+    }
+    setup = &data[sizeof(USBPCAP_BUFFER_CONTROL_HEADER)];
 
     initialize_control_header(hdr, ctx->roothub, deviceAddress, 8,
                               USBPCAP_CONTROL_STAGE_SETUP, function, FALSE, out);
@@ -223,9 +249,24 @@ static void write_complete_packet(descriptor_callback_context *ctx,
                                   int payload_length,
                                   BOOL out)
 {
-    int data_len = sizeof(USBPCAP_BUFFER_CONTROL_HEADER) + payload_length;
-    UINT8 *data = (UINT8*)malloc(data_len);
-    PUSBPCAP_BUFFER_CONTROL_HEADER hdr = (PUSBPCAP_BUFFER_CONTROL_HEADER)data;
+    int data_len;
+    UINT8 *data;
+    PUSBPCAP_BUFFER_CONTROL_HEADER hdr;
+    if (ctx->failed || payload_length < 0 ||
+        payload_length > INT_MAX - (int)sizeof(USBPCAP_BUFFER_CONTROL_HEADER) ||
+        (payload_length > 0 && payload == NULL))
+    {
+        ctx->failed = TRUE;
+        return;
+    }
+    data_len = (int)sizeof(USBPCAP_BUFFER_CONTROL_HEADER) + payload_length;
+    data = (UINT8*)malloc(data_len);
+    if (data == NULL)
+    {
+        ctx->failed = TRUE;
+        return;
+    }
+    hdr = (PUSBPCAP_BUFFER_CONTROL_HEADER)data;
 
     initialize_control_header(hdr, ctx->roothub, deviceAddress, payload_length,
                               USBPCAP_CONTROL_STAGE_COMPLETE, function, TRUE, out);
@@ -245,7 +286,14 @@ write_device_descriptor_complete(descriptor_callback_context *ctx,
     int data_len = sizeof(USBPCAP_BUFFER_CONTROL_HEADER) + 18;
     UINT8 *data = (UINT8*)malloc(data_len);
     PUSBPCAP_BUFFER_CONTROL_HEADER hdr = (PUSBPCAP_BUFFER_CONTROL_HEADER)data;
-    UINT8 *payload = &data[sizeof(USBPCAP_BUFFER_CONTROL_HEADER)];
+    UINT8 *payload;
+    if (ctx->failed || data == NULL || descriptor == NULL)
+    {
+        ctx->failed = TRUE;
+        free(data);
+        return;
+    }
+    payload = &data[sizeof(USBPCAP_BUFFER_CONTROL_HEADER)];
 
     initialize_control_header(hdr, ctx->roothub, deviceAddress, 18,
                               USBPCAP_CONTROL_STAGE_COMPLETE,
@@ -280,7 +328,7 @@ descriptor_callback(HANDLE hub, ULONG port, USHORT deviceAddress,
     descriptor_callback_context *ctx = (descriptor_callback_context *)context;
     PUSB_DESCRIPTOR_REQUEST request;
 
-    if (!USBPcapIsDeviceFiltered(ctx->addresses, deviceAddress))
+    if (ctx->failed || !USBPcapIsDeviceFiltered(ctx->addresses, deviceAddress))
     {
         return;
     }
@@ -290,7 +338,15 @@ descriptor_callback(HANDLE hub, ULONG port, USHORT deviceAddress,
                        USB_DEVICE_DESCRIPTOR_TYPE << 8, 0, 18, FALSE);
     write_device_descriptor_complete(ctx, deviceAddress, desc);
 
+    if (ctx->failed)
+    {
+        return;
+    }
     request = get_config_descriptor(hub, port, 0);
+    if (request == NULL && GetLastError() == ERROR_NOT_ENOUGH_MEMORY)
+    {
+        ctx->failed = TRUE;
+    }
     if (request)
     {
         PUSB_CONFIGURATION_DESCRIPTOR config;
@@ -319,19 +375,39 @@ descriptor_callback(HANDLE hub, ULONG port, USHORT deviceAddress,
 
 void *generate_pcap_packets(list_entry *head, int *out_len)
 {
-    int total_length = 0;
+    size_t total_length = 0;
     list_entry *e;
     UINT8 *pcap;
-    int offset;
+    size_t offset;
 
+    if (out_len == NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    *out_len = 0;
     for (e = head; e; e = e->next)
     {
-        total_length += sizeof(pcaprec_hdr_t);
-        total_length += e->length;
+        if (e->length <= 0 || e->data == NULL ||
+            (size_t)e->length > INT_MAX - sizeof(pcaprec_hdr_t) ||
+            total_length > INT_MAX - sizeof(pcaprec_hdr_t) - (size_t)e->length)
+        {
+            SetLastError(ERROR_INVALID_DATA);
+            return NULL;
+        }
+        total_length += sizeof(pcaprec_hdr_t) + (size_t)e->length;
     }
-
-    *out_len = total_length;
+    if (total_length == 0)
+    {
+        SetLastError(ERROR_SUCCESS);
+        return NULL;
+    }
     pcap = (UINT8*)malloc(total_length);
+    if (pcap == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     offset = 0;
     for (e = head; e; e = e->next)
     {
@@ -355,38 +431,61 @@ void *generate_pcap_packets(list_entry *head, int *out_len)
         offset += e->length;
     }
 
+    *out_len = (int)total_length;
+    SetLastError(ERROR_SUCCESS);
     return pcap;
 }
 
 void *descriptors_generate_pcap(const char *filter, int *pcap_length, PUSBPCAP_ADDRESS_FILTER addresses)
 {
     void *pcap_packets;
-    int pcap_packets_length;
-    descriptor_callback_context ctx;
+    descriptor_callback_context ctx = {0};
     const char *tmp;
-    for (tmp = filter; *tmp; ++tmp) { /* Nothing to do here */ }
-    --tmp;
-    while (tmp > filter)
+    unsigned long roothub = 0;
+    DWORD error;
+
+    if (pcap_length == NULL)
     {
-        if ((*tmp >= '0') && (*tmp <= '9'))
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    *pcap_length = 0;
+    if (filter == NULL || *filter == '\0' || addresses == NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    tmp = filter + strlen(filter);
+    while (tmp > filter && tmp[-1] >= '0' && tmp[-1] <= '9') --tmp;
+    while (*tmp)
+    {
+        roothub = roothub * 10 + (unsigned long)(*tmp++ - '0');
+        if (roothub > USHRT_MAX)
         {
-           --tmp;
-        }
-        else
-        {
-            tmp++;
-            break;
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return NULL;
         }
     }
-    ctx.roothub = (USHORT)atoi(tmp);
+    ctx.roothub = (USHORT)roothub;
     ctx.addresses = addresses;
-    ctx.head = NULL;
-    ctx.tail = NULL;
-    enumerate_all_connected_devices(filter, descriptor_callback, &ctx);
+    if (!enumerate_all_connected_devices_checked(filter, descriptor_callback, &ctx))
+    {
+        error = GetLastError();
+        free_list(ctx.head);
+        SetLastError(error != ERROR_SUCCESS ? error : ERROR_GEN_FAILURE);
+        return NULL;
+    }
 
-    pcap_packets = generate_pcap_packets(ctx.head, &pcap_packets_length);
+    if (ctx.failed)
+    {
+        free_list(ctx.head);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    pcap_packets = generate_pcap_packets(ctx.head, pcap_length);
+    error = GetLastError();
     free_list(ctx.head);
-    *pcap_length = pcap_packets_length;
+    SetLastError(error);
     return pcap_packets;
 }
 

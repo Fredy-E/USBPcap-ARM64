@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <tchar.h>
 #include "filters.h"
 
@@ -19,6 +20,7 @@ struct list
     struct list_entry *head;
     struct list_entry *tail;
     int count;
+    BOOL failed;
 };
 
 struct list_entry
@@ -151,8 +153,8 @@ static BOOL find_usbpcap_filters(struct list *list,
     POBJDIR_INFORMATION info;
     PWSTR path = L"\\Device";
 
-    str.Length = wcslen(path)*2;
-    str.MaximumLength = wcslen(path)*2+2;
+    str.Length = (USHORT)(sizeof(L"\\Device") - sizeof(WCHAR));
+    str.MaximumLength = (USHORT)sizeof(L"\\Device");
     str.Buffer = path;
 
     InitializeObjectAttributes(&attr,
@@ -195,6 +197,7 @@ static BOOL find_usbpcap_filters(struct list *list,
     if (status != 0)
     {
         fprintf(stderr, "NtQueryDirectoryObject() failed\n");
+        NtClose(handle);
         HeapFree(GetProcessHeap(), 0, info);
         return FALSE;
     }
@@ -265,8 +268,19 @@ static void add_to_list(struct list *list,
     int len;
     struct list_entry *entry;
 
+    if (list->failed || str == NULL || str->Buffer == NULL ||
+        str->Length % sizeof(WCHAR) != 0 || list->count == INT_MAX)
+    {
+        list->failed = TRUE;
+        return;
+    }
     len = str->Length / sizeof(WCHAR);
-    device = malloc(len + 1 + prefix_len);
+    device = malloc((size_t)len + 1 + prefix_len);
+    if (device == NULL)
+    {
+        list->failed = TRUE;
+        return;
+    }
 
     for (i = 0; i < prefix_len; i++)
     {
@@ -280,6 +294,12 @@ static void add_to_list(struct list *list,
     device[prefix_len+len] = '\0';
 
     entry = malloc(sizeof(struct list_entry));
+    if (entry == NULL)
+    {
+        free(device);
+        list->failed = TRUE;
+        return;
+    }
     entry->device = device;
     entry->next = NULL;
 
@@ -295,22 +315,39 @@ void filters_initialize()
     list.head = NULL;
     list.tail = NULL;
     list.count = 0;
+    list.failed = FALSE;
 
-    init_undocumented();
-    find_usbpcap_filters(&list, add_to_list);
+    filters_free();
+    if (!init_undocumented()) return;
+    if (!find_usbpcap_filters(&list, add_to_list)) list.failed = TRUE;
 
-    usbpcapFilters = (struct filters**)malloc(sizeof(struct filters*) * (list.count + 1));
+    if (list.failed || (size_t)list.count + 1 > (size_t)-1 / sizeof(struct filters*))
+    {
+        list_free(&list, TRUE);
+        return;
+    }
+    usbpcapFilters = (struct filters**)malloc(sizeof(struct filters*) * ((size_t)list.count + 1));
+    if (usbpcapFilters == NULL)
+    {
+        list_free(&list, TRUE);
+        return;
+    }
+    memset(usbpcapFilters, 0, sizeof(struct filters*) * ((size_t)list.count + 1));
     entry = list.head;
     for (i = 0; i < list.count && entry != NULL; i++)
     {
         usbpcapFilters[i] = (struct filters*)malloc(sizeof(struct filters));
+        if (usbpcapFilters[i] == NULL)
+        {
+            filters_free();
+            list_free(&list, TRUE);
+            return;
+        }
         usbpcapFilters[i]->device = entry->device;
-
+        entry->device = NULL; /* Ownership transferred exactly once. */
         entry = entry->next;
     }
-    usbpcapFilters[list.count] = NULL;
-
-    list_free(&list, FALSE);
+    list_free(&list, TRUE);
 }
 
 void filters_free()
@@ -329,18 +366,20 @@ void filters_free()
         i++;
     }
     free(usbpcapFilters);
+    usbpcapFilters = NULL;
 }
 
 BOOL is_usbpcap_upper_filter_installed()
 {
     LONG regVal;
     HKEY hkey;
-    LONG length;
+    DWORD length;
+    DWORD capacity;
     DWORD type;
     LPTSTR multisz;
 
     PTSTR lookup = _T("\0USBPcap\0");
-    int i, j;
+    DWORD i, j;
 
     regVal = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
                           _T("System\\CurrentControlSet\\Control\\Class\\{36FC9E60-C465-11CF-8056-444553540000}"),
@@ -375,11 +414,17 @@ BOOL is_usbpcap_upper_filter_installed()
         return FALSE;
     }
 
-    multisz = (LPTSTR)malloc(length);
+    capacity = length;
+    multisz = (LPTSTR)malloc((size_t)capacity);
+    if (multisz == NULL)
+    {
+        RegCloseKey(hkey);
+        return FALSE;
+    }
     regVal = RegQueryValueEx(hkey, _T("UpperFilters"),
-                             NULL, NULL, multisz, &length);
+                             NULL, &type, (LPBYTE)multisz, &length);
 
-    if (regVal != ERROR_SUCCESS)
+    if (regVal != ERROR_SUCCESS || type != REG_MULTI_SZ || length > capacity)
     {
         fprintf(stderr, "Failed to read UpperFilters value! Code %d\n", regVal);
         free(multisz);

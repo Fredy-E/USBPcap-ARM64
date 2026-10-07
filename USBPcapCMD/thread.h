@@ -33,9 +33,11 @@ struct thread_data
     BOOLEAN capture_new; /* TRUE if we should automatically capture from new devices. */
     UINT32 snaplen; /* Snapshot length */
     UINT32 bufferlen; /* Internal kernel-mode buffer size */
-    volatile BOOL process; /* FALSE if thread should stop */
+    volatile LONG process; /* Access with interlocked operations while worker runs. */
     HANDLE read_handle; /* Handle to read data from. */
-    HANDLE write_handle; /* Handle to write data to. */
+    HANDLE write_handle; /* Owned only when write_handle_owned is TRUE. */
+    BOOL write_handle_owned; /* Standard output is borrowed, not closed by capture. */
+    BOOL monitor_write_handle; /* Owned overlapped duplex pipe supports dummy reads. */
     HANDLE job_handle; /* Handle to job object of worker process. */
     HANDLE worker_process_thread; /* Handle to breakaway worker process main thread. */
     HANDLE exit_event; /* Handle to event that indicates that main thread should exit. */
@@ -46,5 +48,8 @@ struct thread_data
 
 HANDLE create_filter_read_handle(struct thread_data *data);
 DWORD WINAPI read_thread(LPVOID param);
+BOOL capture_running(struct thread_data *data);
+void request_capture_stop(struct thread_data *data);
+void stop_capture_thread(struct thread_data *data, HANDLE thread);
 
 #endif /* USBPCAP_CMD_THREAD_H */

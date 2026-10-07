@@ -13,41 +13,63 @@
 #include <cfgmgr32.h>
 #include <tchar.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <stdio.h>
 
 typedef struct {
     LPTSTR *array;
     int used;
     int size;
+    BOOL failed;
 } StringArray;
 
 static StringArray non_standard_hwids; /* Stores non standard HWIDs. */
 
 static void init_string_array(StringArray *a, int initial_size)
 {
-    a->array = (LPTSTR *)malloc(initial_size * sizeof(LPTSTR));
-    a->used = 0;
+    a->array = NULL;
+    a->used = a->size = 0;
+    a->failed = FALSE;
+    if (initial_size <= 0 || (size_t)initial_size > (size_t)-1 / sizeof(LPTSTR))
+    {
+        a->failed = TRUE;
+        return;
+    }
+    a->array = (LPTSTR *)malloc((size_t)initial_size * sizeof(LPTSTR));
+    if (a->array == NULL) { a->failed = TRUE; return; }
     a->size = initial_size;
 }
 
-static void insert_string_array(StringArray *a, LPTSTR hwid)
+static BOOL insert_string_array(StringArray *a, LPTSTR hwid)
 {
+    LPTSTR copy;
+    if (a->failed || hwid == NULL) { a->failed = TRUE; return FALSE; }
+    copy = _tcsdup(hwid);
+    if (copy == NULL) { a->failed = TRUE; return FALSE; }
     if (a->used == a->size)
     {
         LPTSTR *tmp;
-
-        a->size *= 2;
-        tmp = (LPTSTR *)realloc(a->array, a->size * sizeof(LPTSTR));
+        int capacity;
+        if (a->size <= 0 || a->size > INT_MAX / 2 ||
+            (size_t)a->size * 2 > (size_t)-1 / sizeof(LPTSTR))
+        {
+            free(copy);
+            a->failed = TRUE;
+            return FALSE;
+        }
+        capacity = a->size * 2;
+        tmp = (LPTSTR *)realloc(a->array, (size_t)capacity * sizeof(LPTSTR));
         if (tmp == NULL)
         {
-            fprintf(stderr, "failed to insert %s to string array!\n",
-                    hwid);
-            return;
+            free(copy);
+            a->failed = TRUE;
+            return FALSE;
         }
         a->array = tmp;
+        a->size = capacity; /* Publish only after successful growth. */
     }
-
-    a->array[a->used++] = _tcsdup(hwid);
+    a->array[a->used++] = copy;
+    return TRUE;
 }
 
 static void free_string_array(StringArray *a)
@@ -84,9 +106,9 @@ static BOOL is_standard_hwid(LPTSTR hwid)
     return FALSE;
 }
 
-static void add_non_standard_hwid(LPTSTR hwid)
+static BOOL add_non_standard_hwid(LPTSTR hwid)
 {
-    insert_string_array(&non_standard_hwids, hwid);
+    return insert_string_array(&non_standard_hwids, hwid);
 }
 
 static BOOL is_non_standard_hwid_known(LPTSTR hwid)
@@ -103,32 +125,35 @@ static BOOL is_non_standard_hwid_known(LPTSTR hwid)
     return FALSE;
 }
 
-static PTSTR build_non_standard_reg_multi_sz(StringArray *a,
-                                             int *length)
+static PTSTR build_non_standard_reg_multi_sz(StringArray *a, int *length)
 {
     PTSTR multi_sz;
-    PTSTR ptr;
-
+    size_t chars = 1;
+    size_t offset = 0;
     int i;
-    int len;
-
-    for (len=1, i=0; i<a->used; i++)
+    *length = 0;
+    if (a->failed) return NULL;
+    for (i = 0; i < a->used; i++)
     {
-        len += _tcslen(a->array[i]) + 1;
+        size_t count;
+        if (a->array[i] == NULL) return NULL;
+        count = _tcslen(a->array[i]);
+        if (count >= INT_MAX / sizeof(TCHAR)) return NULL;
+        ++count;
+        if (chars > INT_MAX / sizeof(TCHAR) - count) return NULL;
+        chars += count;
     }
-
-    len *= sizeof(TCHAR);
-
-    multi_sz = malloc(len);
-    memset(multi_sz, 0, len);
-
-    for (ptr = multi_sz, i = 0; i < a->used; i++)
+    if (chars == 1) chars = 2; /* Empty MULTI_SZ still needs two NULs. */
+    multi_sz = (PTSTR)malloc(chars * sizeof(TCHAR));
+    if (multi_sz == NULL) return NULL;
+    memset(multi_sz, 0, chars * sizeof(TCHAR));
+    for (i = 0; i < a->used; i++)
     {
-        _tcscpy_s(ptr, len - (ptr - multi_sz), a->array[i]);
-        ptr += _tcslen(a->array[i]) + 1;
+        size_t count = _tcslen(a->array[i]) + 1;
+        memcpy(multi_sz + offset, a->array[i], count * sizeof(TCHAR));
+        offset += count;
     }
-
-    *length = len;
+    *length = (int)(chars * sizeof(TCHAR));
     return multi_sz;
 }
 
@@ -177,12 +202,13 @@ static LPTSTR * GetMultiSzIndexArray(__in __drv_aliasesMem LPTSTR MultiSz)
 {
     LPTSTR scan;
     LPTSTR *array;
-    int elements;
+    size_t elements;
 
     for (scan = MultiSz, elements = 0; scan[0] ;elements++)
     {
         scan += lstrlen(scan)+1;
     }
+    if (elements > (size_t)-1 / sizeof(LPTSTR) - 2) return NULL;
     array = (LPTSTR*)malloc(sizeof(LPTSTR) * (elements+2));
     if(!array)
     {
@@ -204,6 +230,8 @@ static LPTSTR * GetMultiSzIndexArray(__in __drv_aliasesMem LPTSTR MultiSz)
 
 /*
  * Retrieves multi-sz devnode registry property for given DEVINST.
+ * NULL with ERROR_NOT_ENOUGH_MEMORY means preparation failed, not absence.
+ * Missing/invalid/unavailable properties return NULL with ERROR_SUCCESS.
  *
  * Returns NULL-terminated array of strings on success.
  * Array must be freed using DelMultiSz().
@@ -214,13 +242,16 @@ static LPTSTR *GetDevMultiSz(DEVINST roothub, ULONG property)
 {
     LPTSTR buffer;
     ULONG size;
+    ULONG capacity;
     ULONG dataType;
     LPTSTR * array;
     DWORD szChars;
     CONFIGRET ret;
+    DWORD error = ERROR_SUCCESS;
 
     size = 0;
     buffer = NULL;
+    SetLastError(ERROR_SUCCESS);
 
     ret = CM_Get_DevNode_Registry_Property(roothub, property, &dataType,
                                            buffer, &size, 0);
@@ -234,16 +265,23 @@ static LPTSTR *GetDevMultiSz(DEVINST roothub, ULONG property)
     {
         goto failed;
     }
-    buffer = malloc(sizeof(TCHAR)*((size/sizeof(TCHAR))+2));
+    capacity = size;
+    if ((size_t)capacity / sizeof(TCHAR) > (size_t)-1 / sizeof(TCHAR) - 2)
+    {
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        goto failed;
+    }
+    buffer = malloc(((size_t)capacity / sizeof(TCHAR) + 2) * sizeof(TCHAR));
     if (!buffer)
     {
+        error = ERROR_NOT_ENOUGH_MEMORY;
         goto failed;
     }
 
     ret = CM_Get_DevNode_Registry_Property(roothub, property, &dataType,
                                            buffer, &size, 0);
 
-    if (ret == CR_SUCCESS)
+    if (ret == CR_SUCCESS && dataType == REG_MULTI_SZ && size <= capacity && size % sizeof(TCHAR) == 0)
     {
         szChars = size/sizeof(TCHAR);
         buffer[szChars] = TEXT('\0');
@@ -251,8 +289,10 @@ static LPTSTR *GetDevMultiSz(DEVINST roothub, ULONG property)
         array = GetMultiSzIndexArray(buffer);
         if (array)
         {
+            SetLastError(ERROR_SUCCESS);
             return array;
         }
+        error = ERROR_NOT_ENOUGH_MEMORY;
     }
 
 failed:
@@ -260,6 +300,7 @@ failed:
     {
         free(buffer);
     }
+    SetLastError(error);
     return NULL;
 }
 
@@ -293,14 +334,24 @@ void find_non_standard_hwids(HDEVINFO devs,
     /* Assume that all host controller children are Root Hubs */
     cr = CM_Get_Child(&roothub, devInfo->DevInst, 0);
 
-    while (cr == CR_SUCCESS)
+    while (cr == CR_SUCCESS && !non_standard_hwids.failed)
     {
         BOOL standard = FALSE;
 
         hwIds = GetDevMultiSz(roothub, CM_DRP_HARDWAREID);
+        if (hwIds == NULL && GetLastError() == ERROR_NOT_ENOUGH_MEMORY)
+            non_standard_hwids.failed = TRUE;
         compatIds = GetDevMultiSz(roothub, CM_DRP_COMPATIBLEIDS);
+        if (compatIds == NULL && GetLastError() == ERROR_NOT_ENOUGH_MEMORY)
+            non_standard_hwids.failed = TRUE;
+        if (non_standard_hwids.failed)
+        {
+            DelMultiSz(hwIds);
+            DelMultiSz(compatIds);
+            break;
+        }
 
-        if (hwIds)
+        if (hwIds && hwIds[0] != NULL)
         {
             for (tmpIds = hwIds; tmpIds[0] != NULL; tmpIds++)
             {
@@ -322,8 +373,8 @@ void find_non_standard_hwids(HDEVINFO devs,
                 }
                 else
                 {
-                    add_non_standard_hwid(hwIds[0]);
-                    printf("Added %s to non-standard list.\n", hwIds[0]);
+                    if (add_non_standard_hwid(hwIds[0]))
+                        printf("Added %s to non-standard list.\n", hwIds[0]);
                 }
             }
         }
@@ -435,12 +486,12 @@ void init_non_standard_roothub_hwid()
 
     init_string_array(&non_standard_hwids, 1);
 
-    foreach_host_controller(find_non_standard_hwids);
+    if (!non_standard_hwids.failed) foreach_host_controller(find_non_standard_hwids);
 
-    if (non_standard_hwids.used > 0)
+    if (!non_standard_hwids.failed && non_standard_hwids.used > 0)
     {
         multi_sz = build_non_standard_reg_multi_sz(&non_standard_hwids, &length);
-        set_non_standard_hwids_reg_key(multi_sz, length);
+        if (multi_sz != NULL) set_non_standard_hwids_reg_key(multi_sz, length);
         free(multi_sz);
     }
 
