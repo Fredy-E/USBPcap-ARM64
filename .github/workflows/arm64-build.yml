@@ -65,6 +65,7 @@ jobs:
 
       - name: Locate ARM64 MSBuild
         id: locate
+        if: always()
         shell: pwsh
         run: |
           $candidates = @()
@@ -83,6 +84,7 @@ jobs:
           }
 
       - name: Toolchain prerequisite check (informational)
+        if: always()
         continue-on-error: true
         shell: pwsh
         run: |
@@ -90,6 +92,7 @@ jobs:
           python build/arm64/build.py --check-only --vs-root "$env:VS_ROOT" --msbuild "$env:MSBUILD_PATH"
 
       - name: Build Release (informational while toolchain is being brought up)
+        if: always()
         continue-on-error: true
         shell: pwsh
         run: |
