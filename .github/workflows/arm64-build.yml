@@ -47,8 +47,8 @@ jobs:
           Write-Host '== MSBuild (arm64) candidates =='
           Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe','C:\Program Files (x86)\Microsoft Visual Studio\*\*\MSBuild\Current\Bin\arm64\MSBuild.exe' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
           Write-Host '== VC Tools versions =='
-          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-          Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
           Write-Host '== package managers (for possible toolchain install step) =='
           foreach ($tool in 'choco','winget') { $c = Get-Command $tool -ErrorAction SilentlyContinue; if ($c) { Write-Host "$tool -> $($c.Source)" } else { Write-Host "$tool -> not found" } }
 
@@ -78,6 +78,16 @@ jobs:
             "MSBUILD_PATH=$($msbuild.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             Write-Host "VS root: $vsroot"
             Write-Host "MSBuild: $($msbuild.FullName)"
+            $toolsetRoot = Join-Path $vsroot 'VC\Tools\MSVC'
+            $toolsets = @(Get-ChildItem $toolsetRoot -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+            Write-Host "installed MSVC toolsets: $($toolsets -join ', ')"
+            $v143 = $toolsets | Where-Object { $_ -like '14.4*' } | Sort-Object | Select-Object -Last 1
+            if ($v143) {
+              "VC_TOOLS_VERSION=$v143" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "v143-family toolset selected: $v143"
+            } else {
+              Write-Host 'No 14.4x (v143-family) toolset found; VS default will be used'
+            }
           } else {
             Write-Host 'No ARM64 MSBuild found in standard locations'
             "MSBUILD_PATH=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -89,7 +99,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
-          python build/arm64/build.py --check-only --vs-root "$env:VS_ROOT" --msbuild "$env:MSBUILD_PATH"
+          $common = @('--vs-root', $env:VS_ROOT, '--msbuild', $env:MSBUILD_PATH)
+          if ($env:VC_TOOLS_VERSION) { $common += @('--vc-tools-version', $env:VC_TOOLS_VERSION) }
+          python build/arm64/build.py --check-only @common
 
       - name: Build Release (informational while toolchain is being brought up)
         if: always()
@@ -97,7 +109,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
-          python build/arm64/build.py --configuration Release --vs-root "$env:VS_ROOT" --msbuild "$env:MSBUILD_PATH"
+          $common = @('--vs-root', $env:VS_ROOT, '--msbuild', $env:MSBUILD_PATH)
+          if ($env:VC_TOOLS_VERSION) { $common += @('--vc-tools-version', $env:VC_TOOLS_VERSION) }
+          python build/arm64/build.py --configuration Release @common
 
       - name: Upload logs (always)
         if: always()
@@ -105,5 +119,14 @@ jobs:
         with:
           name: arm64-logs
           path: artifacts/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload offline bundle (if built)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-offline-bundle
+          path: artifacts/package/ARM64/**
           if-no-files-found: ignore
           retention-days: 14
