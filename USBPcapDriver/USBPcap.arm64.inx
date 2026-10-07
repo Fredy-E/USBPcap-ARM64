@@ -1,0 +1,63 @@
+; OFFLINE RESEARCH PACKAGE ONLY. Not a qualified installable driver package.
+[Version]
+Signature           = "$WINDOWS NT$"
+PnpLockdown         = 1
+Class               = USB
+ClassGuid           = {36FC9E60-C465-11CF-8056-444553540000}
+DriverPackageType   = ClassFilter
+Provider            = %PROVIDER%
+CatalogFile.NTarm64 = USBPcaparm64.cat
+DriverVer = 02/09/2025,1.5.4.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskId1%,,,"."
+
+[SourceDisksFiles]
+USBPcap.sys = 1,,
+
+[DefaultInstall.NTarm64]
+CopyFiles = USBPcap.CopyFiles
+AddReg    = USBPcap.AddReg
+
+[DefaultUninstall.NTarm64]
+LegacyUninstall = 1
+DelFiles  = USBPcap.DeleteFiles
+DelReg    = USBPcap.DelReg
+
+[USBPcap.CopyFiles]
+USBPcap.sys
+
+[USBPcap.DeleteFiles]
+USBPcap.sys
+
+[USBPcap.AddReg]
+;Add USBPcap to UpperFilters
+HKLM, System\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-444553540000}, UpperFilters, 0x00010008, USBPcap
+
+[USBPcap.DelReg]
+;Delete USBPcap from UpperFilters
+HKLM, System\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-444553540000}, UpperFilters, 0x00018002, USBPcap
+
+[DefaultInstall.NTarm64.Services]
+AddService = USBPcap,,Service.AddService
+
+[DefaultUninstall.NTarm64.Services]
+DelService = USBPcap,0x00000200
+
+[Service.AddService]
+DisplayName    = %USBPcap.SvcDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 2               ; SERVICE_ERROR_SEVERE
+ServiceBinary  = %12%\USBPcap.sys
+
+[Strings]
+PROVIDER             = "USBPcap"
+StdMfg               = "USBPcap Developers"
+DiskId1              = "USBPcap Installation Disk #1"
+USBPcap.DeviceDesc   = "USBPcap Filter Driver"
+USBPcap.SvcDesc      = "USBPcap Capture Service"
+

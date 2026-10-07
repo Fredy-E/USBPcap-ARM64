@@ -3,11 +3,33 @@ USBPcap - USB Packet capture for Windows
 End-user installer is available at: http://desowin.org/usbpcap
 Following informations are intended for developers and power users only.
 
+About this repository (ARM64 port):
+  Unofficial, community ARM64 port of USBPcap adding native Windows on ARM
+  build support and driver/CLI robustness repairs. Not affiliated with or
+  endorsed by the upstream project or desowin.org.
+  Changes relative to upstream commit 477b6ed (2025-01-25):
+    * native ARM64 build system (VS 2022 v143, pinned modern SDK/WDK NuGet
+      packages; build-only, unsigned/offline) - see build/arm64/README.md;
+    * driver robustness repairs (buffer/queue/URB lifetime and completion
+      handling, PnP and power paths, hardware-ID handling, allocation failure
+      paths);
+    * CLI robustness repairs (descriptor-discovery bounds, property
+      publication, child-process rundown).
+  Modifications by Fredy-E (2026); see the git history for details.
+
 Directory overview:
   USBPcapCMD - sample user space application
   USBPcapDriver - filter driver used to capture data
 
 Build instructions:
+  Native ARM64 build-only (VS 2022 + pinned modern SDK/WDK NuGet packages):
+    See build/arm64/README.md and USBPcap.ARM64.sln.
+    python build/arm64/build.py --static-only
+    python build/arm64/build.py --configuration Release
+  This ARM64 workflow is unsigned/offline only and does not install or load
+  drivers. The installation/signing directions below belong to legacy builds;
+  they are not part of the ARM64 build-only workflow.
+
   Download and install Windows Driver Kit 7.1.0 from Microsoft
     http://www.microsoft.com/en-us/download/details.aspx?id=11800
 
@@ -43,6 +65,7 @@ Usage:
   instance per root hub) and specify the output pcap file name.
 
 Licensing:
-  USBPcapDriver is licensed under GPLv2 license.
-  USBPcapCMD is licensed under BSD 2-Clause license.
+  USBPcapDriver is licensed under GPLv2 license - full text in LICENSE-GPL-2.0.txt.
+  USBPcapCMD is licensed under BSD 2-Clause license - full text in LICENSE-BSD-2-Clause.txt.
+  Modifications for the ARM64 port by Fredy-E (2026).
 

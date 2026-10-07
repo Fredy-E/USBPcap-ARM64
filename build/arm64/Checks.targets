@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="USBPcapBuildOnlyGuard" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Platform)' != 'ARM64'" Text="This solution only supports native ARM64 (not ARM64EC/x64)." />
+    <Error Condition="'$(Configuration)' != 'Debug' and '$(Configuration)' != 'Release'" Text="Choose Debug or Release." />
+    <Error Condition="'$(SignMode)' != 'Off' or '$(EnableTestSign)' != 'false' or '$(DriverDeploy)' != 'false' or '$(EnableInf2cat)' != 'false'" Text="Build-only safety guard: signing, deployment, and automatic catalog creation are prohibited." />
+    <Error Condition="'$(WindowsTargetPlatformVersion)' != '10.0.26100.0'" Text="The pinned SDK/WDK target is 10.0.26100.0 (NuGet 10.0.26100.3323)." />
+    <Error Condition="!Exists('$(USBPcapSdk)build\native\Microsoft.Windows.SDK.cpp.props') or !Exists('$(USBPcapSdkArm64)build\native\Microsoft.Windows.SDK.cpp.arm64.props') or !Exists('$(USBPcapWdk)build\native\Microsoft.Windows.WDK.arm64.props')" Text="Missing pinned SDK/WDK packages. Restore build/arm64/packages.config to repo packages/ before building." />
+    <Error Condition="!Exists('$(VCToolsInstallDir)include\vcruntime.h')" Text="Missing MSVC C++ headers. Install/repair v143 ARM64 C++ build tools." />
+    <Error Condition="!Exists('$(USBPcapWdk)c\Lib\$(USBPcapKitVersion)\km\ARM64\bufferoverflowfastfailk.lib')" Text="ARM64 WDK GS-entry library is missing." />
+    <Message Importance="High" Text="Unsigned build only. WDM GS entry; no deployment. INF/API/catalog checks run separately via build/arm64/build.py, not implicitly by this v143 project." />
+  </Target>
+</Project>

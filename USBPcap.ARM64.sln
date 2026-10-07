@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "USBPcap.ARM64", "USBPcapDriver\USBPcap.ARM64.vcxproj", "{9C54EF34-97C5-44BA-BBA6-5B2385C53F64}"
+EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "USBPcapCMD.ARM64", "USBPcapCMD\USBPcapCMD.ARM64.vcxproj", "{B2537488-6872-4FF7-8E80-E71BB57AD3BE}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|ARM64 = Debug|ARM64
+		Release|ARM64 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{9C54EF34-97C5-44BA-BBA6-5B2385C53F64}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{9C54EF34-97C5-44BA-BBA6-5B2385C53F64}.Debug|ARM64.Build.0 = Debug|ARM64
+		{9C54EF34-97C5-44BA-BBA6-5B2385C53F64}.Release|ARM64.ActiveCfg = Release|ARM64
+		{9C54EF34-97C5-44BA-BBA6-5B2385C53F64}.Release|ARM64.Build.0 = Release|ARM64
+		{B2537488-6872-4FF7-8E80-E71BB57AD3BE}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{B2537488-6872-4FF7-8E80-E71BB57AD3BE}.Debug|ARM64.Build.0 = Debug|ARM64
+		{B2537488-6872-4FF7-8E80-E71BB57AD3BE}.Release|ARM64.ActiveCfg = Release|ARM64
+		{B2537488-6872-4FF7-8E80-E71BB57AD3BE}.Release|ARM64.Build.0 = Release|ARM64
+	EndGlobalSection
+EndGlobal

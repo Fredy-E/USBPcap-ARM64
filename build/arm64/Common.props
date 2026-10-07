@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <USBPcapRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\'))</USBPcapRoot>
+    <USBPcapKitPackageVersion>10.0.26100.3323</USBPcapKitPackageVersion>
+    <USBPcapKitVersion>10.0.26100.0</USBPcapKitVersion>
+    <USBPcapPackagesDir Condition="'$(USBPcapPackagesDir)' == ''">$(USBPcapRoot)packages\</USBPcapPackagesDir>
+    <USBPcapSdk>$(USBPcapPackagesDir)Microsoft.Windows.SDK.CPP.$(USBPcapKitPackageVersion)\</USBPcapSdk>
+    <USBPcapSdkArm64>$(USBPcapPackagesDir)Microsoft.Windows.SDK.CPP.arm64.$(USBPcapKitPackageVersion)\</USBPcapSdkArm64>
+    <USBPcapWdk>$(USBPcapPackagesDir)Microsoft.Windows.WDK.ARM64.$(USBPcapKitPackageVersion)\</USBPcapWdk>
+    <WindowsTargetPlatformVersion>$(USBPcapKitVersion)</WindowsTargetPlatformVersion>
+    <SignMode>Off</SignMode>
+    <EnableTestSign>false</EnableTestSign>
+    <EnableInf2cat>false</EnableInf2cat>
+    <DriverDeploy>false</DriverDeploy>
+    <SupportsPackaging>false</SupportsPackaging>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">ARM64</Platform>
+  </PropertyGroup>
+  <!-- Package selection is TARGET ARM64, independent of the compiler/MSBuild host. -->
+  <Import Project="$(USBPcapSdk)build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(USBPcapSdk)build\native\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="$(USBPcapSdkArm64)build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('$(USBPcapSdkArm64)build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
+  <Import Project="$(USBPcapWdk)build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('$(USBPcapWdk)build\native\Microsoft.Windows.WDK.arm64.props')" />
+</Project>

@@ -1,0 +1,4 @@
+/packages/
+/artifacts/
+**/__pycache__/
+*.user
