@@ -1,9 +1,10 @@
 # CI for the USBPcap ARM64 port.
 #
 # Stage 1 (strict): static build-contract tests — pure stdlib, no compiler needed.
-# Stage 2 (informational for now): environment diagnostics + toolchain prerequisite
-# check + a Release build attempt. These steps are marked continue-on-error while the
-# hosted-runner toolchain story is being brought up; they will be made strict once green.
+# Stage 2 (strict): environment diagnostics + toolchain prerequisite check + Release
+# compile/link. No continue-on-error and no skip-on-absent-toolchain path: a missing
+# toolchain or a failed Release build fails the job. Diagnostic logs and artifacts
+# are uploaded with `if: always()` so failures remain inspectable.
 #
 # Scope note: build-only. No driver install/load, no signing, no hardware access.
 
@@ -63,6 +64,9 @@ jobs:
       - name: Static build-contract tests (strict)
         run: python build/arm64/build.py --static-only
 
+      - name: Source-hardening contract tests (strict)
+        run: python build/arm64/test_hardening.py
+
       - name: Locate ARM64 MSBuild
         id: locate
         if: always()
@@ -93,22 +97,26 @@ jobs:
             "MSBUILD_PATH=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-      - name: Toolchain prerequisite check (informational)
+      - name: Toolchain prerequisite check (strict)
         if: always()
-        continue-on-error: true
         shell: pwsh
         run: |
-          if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
+          if (-not $env:MSBUILD_PATH) {
+            Write-Host 'FAIL: no ARM64 MSBuild candidate found. The strict build gate requires an installed ARM64 toolchain.'
+            exit 1
+          }
           $common = @('--vs-root', $env:VS_ROOT, '--msbuild', $env:MSBUILD_PATH)
           if ($env:VC_TOOLS_VERSION) { $common += @('--vc-tools-version', $env:VC_TOOLS_VERSION) }
           python build/arm64/build.py --check-only @common
 
-      - name: Build Release (informational while toolchain is being brought up)
+      - name: Build Release (strict compile/link gate)
         if: always()
-        continue-on-error: true
         shell: pwsh
         run: |
-          if (-not $env:MSBUILD_PATH) { Write-Host 'SKIP: no MSBuild candidate found'; exit 0 }
+          if (-not $env:MSBUILD_PATH) {
+            Write-Host 'FAIL: no ARM64 MSBuild candidate found. The strict Release build gate cannot run.'
+            exit 1
+          }
           $common = @('--vs-root', $env:VS_ROOT, '--msbuild', $env:MSBUILD_PATH)
           if ($env:VC_TOOLS_VERSION) { $common += @('--vc-tools-version', $env:VC_TOOLS_VERSION) }
           python build/arm64/build.py --configuration Release @common

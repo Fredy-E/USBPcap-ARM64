@@ -26,11 +26,15 @@ A focused ARM64 port of USBPcap on top of upstream `desowin/usbpcap` @ [`477b6ed
 
 ## Continuous integration
 
-Pushes to `master` are built and verified on GitHub's hosted `windows-11-arm` runner:
+CI runs on pushes to `master`, pull requests, and manual dispatch, on GitHub's hosted `windows-11-arm` runner. It is a **strict build gate** — not a signing, installation, or hardware qualification:
 
-1. **Strict static build contracts** — 52 tests, no compiler required.
-2. **Full ARM64 Release build** — compile, link, PE checks, INF/catalog validation, and packaging.
-3. CI artifacts: `arm64-logs` (per-stage logs + `validation.json`) and `arm64-offline-bundle` (offline bundle when a build completes).
+1. **Static build contracts and source-hardening checks (strict)** — 52 build-wrapper tests plus 16 source-hardening checks, using Python stdlib and no compiler. Both suites are required; any failure fails the job. These source/fixture checks do not establish kernel runtime safety.
+2. **Toolchain prerequisite check (strict)** — requires ARM64 MSBuild, a v143-family toolset, and the pinned SDK/WDK packages. A missing toolchain **fails the job**; there is no skip-on-absence path.
+3. **Release compile/link (strict)** — full ARM64 Release build: compile, link, PE inspection, INF syntax/signability and catalog checks, offline packaging. A compile/link failure fails the job.
+
+Diagnostic logs are uploaded with `if: always()` (`arm64-logs`); the offline bundle artifact appears only when a build actually completes (`arm64-offline-bundle`).
+
+**Build evidence scope.** CI is build-time only: it never signs, installs, or loads a driver and never touches hardware. A passing run is evidence that the ARM64 sources compiled and passed the offline checks it ran — not evidence of driver load, capture behavior, or production trust. The offline bundle (when produced) is explicitly unsigned and unqualified for installation. No compile/link success is claimed here until a strict run records one; earlier runs that treated the build as informational (`continue-on-error`) are not compile evidence.
 
 ## Quick start (build-only)
 
@@ -48,7 +52,7 @@ The solution file is `USBPcap.ARM64.sln`; see [build/arm64/README.md](build/arm6
 | `USBPcapDriver/` | capture filter driver — GPLv2 |
 | `USBPcapCMD/` | sample user-space application — BSD-2-Clause |
 | `build/arm64/` | ARM64 build system, tests, and documentation |
-| `.github/workflows/` | CI: static contracts + ARM64 Release build |
+| `.github/workflows/` | CI: strict static contracts + strict ARM64 Release build gate |
 
 ## Licensing
 
