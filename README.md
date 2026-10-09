@@ -54,6 +54,13 @@ The solution file is `USBPcap.ARM64.sln`; see [build/arm64/README.md](build/arm6
 | `build/arm64/` | ARM64 build system, tests, and documentation |
 | `.github/workflows/` | CI: strict static contracts + strict ARM64 Release build gate |
 
+## Related automotive interoperability projects
+
+- [VCDS-ARM64](https://github.com/Fredy-E/VCDS-ARM64) — original compatibility and troubleshooting documentation for genuine, licensed VCDS installations on Windows 11 ARM64.
+- [VAG-ARM64](https://github.com/Fredy-E/VAG-ARM64) — companion project hub and VagDiag Android USB-host prototype. Android uses its own USB-host APIs, not this Windows capture driver; ECU diagnostics are not implemented.
+
+USBPcap records traffic for observation. A successful native build or Windows capture does not establish Android USB-OTG operation, decoded vehicle commands, production signing, or vehicle-control safety. This repository retains its build-only distribution scope and existing GPL-2.0 / BSD-2-Clause licenses.
+
 ## Licensing
 
 - `USBPcapDriver` — GPLv2; full text in [LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt)
